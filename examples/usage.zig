@@ -21,17 +21,35 @@ pub fn main() !void {
     std.debug.print("get user:1   = {s}\n", .{(try client.get("user:1", &out)).?});
     std.debug.print("get missing  = {?s}\n", .{try client.get("missing", &out)});
 
-    // A watcher is pushed the new value whenever the key changes.
+    try client.setEx("session", "token", 1000); // expires in 1 second
+
+    // A batch: several operations in one datagram, one round trip, results in order.
+    var b = client.batch();
+    try b.set("a", "1");
+    try b.set("b", "2");
+    try b.get("a");
+    try b.get("nope");
+    var rbuf: [zremdic.proto.max_datagram]u8 = undefined;
+    var results = try b.send(&rbuf);
+    var i: usize = 0;
+    while (results.next()) |r| : (i += 1) {
+        std.debug.print("batch[{d}]     = status {d}, value '{s}'\n", .{ i, @intFromEnum(r.status), r.value });
+    }
+
+    // A watcher is pushed the new value whenever the key changes. Pushes are best effort, so dedupe
+    // by remembering the last value and treat a push as a hint to read the key when it matters.
     var watcher = try zremdic.Client.init("127.0.0.1", port, .{ .timeout_ms = 500 });
     defer watcher.deinit();
     try watcher.subscribe("score");
-
     try client.set("score", "42");
     var kbuf: [64]u8 = undefined;
     var vbuf: [64]u8 = undefined;
     if (try watcher.pollUpdate(&kbuf, &vbuf)) |u| {
         std.debug.print("watcher saw  {s} = {s}\n", .{ u.key, u.value });
     }
+
+    const s = try client.stats();
+    std.debug.print("stats        = gets {d}, sets {d}, hits {d}, misses {d}, keys {d}\n", .{ s.gets, s.sets, s.hits, s.misses, s.keys });
 
     try client.del("user:1");
     std.debug.print("after delete = {?s}\n", .{try client.get("user:1", &out)});
