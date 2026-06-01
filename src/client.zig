@@ -1,7 +1,8 @@
-//! The client. Each call sends one request datagram and waits for the reply that carries the same
-//! id, retransmitting if the socket receive times out. GET, SET, and DEL are idempotent, so a
-//! retransmit is harmless. `subscribe` asks the server to push later changes to this socket, which
-//! `pollUpdate` reads.
+//! The client. Each call sends one request datagram and waits, using poll, for the reply that
+//! carries the same id. If the reply does not arrive within the current window, it retransmits with
+//! an exponentially growing, jittered backoff, so a busy server is not buried under retries. GET,
+//! SET, and DEL are idempotent, so a retransmit is harmless. `subscribe` asks the server to push
+//! later changes to this socket, which `pollUpdate` reads.
 
 const std = @import("std");
 const c = std.c;
@@ -9,8 +10,9 @@ const posix = std.posix;
 const proto = @import("proto.zig");
 
 pub const Options = struct {
-    timeout_ms: u32 = 200,
+    timeout_ms: u32 = 200, // initial wait before the first retransmit
     retries: u32 = 3,
+    backoff_cap_ms: u32 = 2000, // the wait never grows past this
 };
 
 pub const Update = struct {
@@ -22,19 +24,18 @@ pub const Client = struct {
     fd: c.fd_t,
     server: posix.sockaddr.in,
     next_id: u32 = 0,
+    timeout_ms: u32,
     retries: u32,
+    backoff_cap_ms: u32,
+    prng: std.Random.DefaultPrng,
 
     pub fn init(ip: []const u8, port: u16, opts: Options) !Client {
         const fd = c.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
         if (fd < 0) return error.SocketFailed;
-        errdefer _ = c.close(fd);
-
-        var tv = posix.timeval{
-            .sec = @intCast(opts.timeout_ms / 1000),
-            .usec = @intCast((opts.timeout_ms % 1000) * 1000),
-        };
-        _ = c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, @ptrCast(&tv), @sizeOf(posix.timeval));
-
+        // Roomy socket buffers so a large value fits in one datagram (on platforms that allow it).
+        const bufsz: c_int = 1 << 20;
+        _ = c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, @ptrCast(&bufsz), @sizeOf(c_int));
+        _ = c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, @ptrCast(&bufsz), @sizeOf(c_int));
         return .{
             .fd = fd,
             .server = .{
@@ -43,7 +44,10 @@ pub const Client = struct {
                 .addr = std.mem.nativeToBig(u32, try parseIp4(ip)),
                 .zero = [_]u8{0} ** 8,
             },
+            .timeout_ms = @max(1, opts.timeout_ms),
             .retries = @max(1, opts.retries),
+            .backoff_cap_ms = @max(opts.timeout_ms, opts.backoff_cap_ms),
+            .prng = std.Random.DefaultPrng.init(nowMs() ^ @as(u64, @intCast(fd))),
         };
     }
 
@@ -54,14 +58,19 @@ pub const Client = struct {
     /// PING the server. Errors if no reply arrives within the retry budget.
     pub fn ping(self: *Client) !void {
         var buf: [proto.max_datagram]u8 = undefined;
-        const r = try self.roundtrip(.ping, "", "", &buf);
+        const r = try self.roundtrip(.ping, "", "", 0, &buf);
         if (r.status != .ok) return error.ServerError;
     }
 
-    /// Store `value` under `key`.
+    /// Store `value` under `key` with no expiry.
     pub fn set(self: *Client, key: []const u8, value: []const u8) !void {
+        return self.setEx(key, value, 0);
+    }
+
+    /// Store `value` under `key`, expiring it `ttl_ms` milliseconds from now (0 means no expiry).
+    pub fn setEx(self: *Client, key: []const u8, value: []const u8, ttl_ms: u32) !void {
         var buf: [proto.max_datagram]u8 = undefined;
-        const r = try self.roundtrip(.set, key, value, &buf);
+        const r = try self.roundtrip(.set, key, value, ttl_ms, &buf);
         switch (r.status) {
             .ok => {},
             .too_large => return error.TooLarge,
@@ -69,10 +78,10 @@ pub const Client = struct {
         }
     }
 
-    /// Read `key` into `out`, returning the value slice, or null if the key is absent.
+    /// Read `key` into `out`, returning the value slice, or null if the key is absent or expired.
     pub fn get(self: *Client, key: []const u8, out: []u8) !?[]u8 {
         var buf: [proto.max_datagram]u8 = undefined;
-        const r = try self.roundtrip(.get, key, "", &buf);
+        const r = try self.roundtrip(.get, key, "", 0, &buf);
         switch (r.status) {
             .ok => {
                 const n = @min(r.value.len, out.len);
@@ -87,30 +96,46 @@ pub const Client = struct {
     /// Delete `key`.
     pub fn del(self: *Client, key: []const u8) !void {
         var buf: [proto.max_datagram]u8 = undefined;
-        const r = try self.roundtrip(.del, key, "", &buf);
+        const r = try self.roundtrip(.del, key, "", 0, &buf);
         if (r.status != .ok) return error.ServerError;
     }
 
     /// Ask the server to push future changes of `key` to this client.
     pub fn subscribe(self: *Client, key: []const u8) !void {
         var buf: [proto.max_datagram]u8 = undefined;
-        const r = try self.roundtrip(.subscribe, key, "", &buf);
+        const r = try self.roundtrip(.subscribe, key, "", 0, &buf);
         if (r.status != .ok) return error.ServerError;
     }
 
     /// Stop receiving pushed changes of `key`.
     pub fn unsubscribe(self: *Client, key: []const u8) !void {
         var buf: [proto.max_datagram]u8 = undefined;
-        const r = try self.roundtrip(.unsubscribe, key, "", &buf);
+        const r = try self.roundtrip(.unsubscribe, key, "", 0, &buf);
         if (r.status != .ok) return error.ServerError;
     }
 
-    /// Wait up to one receive timeout for a pushed change, copying the key and value into the given
-    /// buffers. Returns null if none arrived. Pushed changes are best effort: a dropped datagram is
-    /// not retransmitted.
+    /// Fetch the server's counters.
+    pub fn stats(self: *Client) !proto.Stats {
+        var buf: [proto.max_datagram]u8 = undefined;
+        const r = try self.roundtrip(.stats, "", "", 0, &buf);
+        if (r.status != .ok) return error.ServerError;
+        return proto.decodeStats(r.value) orelse error.ServerError;
+    }
+
+    /// Begin a batch: queue several operations, then `send` them in one datagram and one round trip.
+    pub fn batch(self: *Client) Batch {
+        return .{ .client = self };
+    }
+
+    /// Wait up to one timeout for a pushed change, copying the key and value into the given buffers.
+    /// Returns null if none arrived. A pushed change with an empty value means the key was deleted.
+    /// Pushed changes are best effort: a dropped datagram is not retransmitted.
     pub fn pollUpdate(self: *Client, key_out: []u8, val_out: []u8) !?Update {
         var buf: [proto.max_datagram]u8 = undefined;
+        const deadline = nowMs() + self.timeout_ms;
         while (true) {
+            const remaining = deadline -| nowMs();
+            if (remaining == 0 or !self.readable(@intCast(remaining))) return null;
             const got = c.recvfrom(self.fd, &buf, buf.len, 0, null, null);
             if (got <= 0) return null;
             const msg = proto.decodeRequest(buf[0..@intCast(got)]) catch continue;
@@ -128,17 +153,36 @@ pub const Client = struct {
         return self.next_id;
     }
 
-    fn roundtrip(self: *Client, op: proto.Op, key: []const u8, value: []const u8, resp_buf: []u8) !proto.Response {
+    // Block up to `ms` for the socket to become readable. Returns false on timeout or error.
+    fn readable(self: *Client, ms: c_int) bool {
+        var pfd = [_]posix.pollfd{.{ .fd = self.fd, .events = posix.POLL.IN, .revents = 0 }};
+        return c.poll(&pfd, 1, ms) > 0;
+    }
+
+    // The wait before the next retransmit: the timeout doubled per attempt, capped, plus jitter.
+    fn backoffMs(self: *Client, attempt: u32) u32 {
+        var w: u64 = self.timeout_ms;
+        var i: u32 = 0;
+        while (i < attempt and w < self.backoff_cap_ms) : (i += 1) w *= 2;
+        if (w > self.backoff_cap_ms) w = self.backoff_cap_ms;
+        const jitter = self.prng.random().uintLessThan(u64, w / 2 + 1);
+        return @intCast(w + jitter);
+    }
+
+    fn roundtrip(self: *Client, op: proto.Op, key: []const u8, value: []const u8, ttl_ms: u32, resp_buf: []u8) !proto.Response {
         const id = self.newId();
         var req: [proto.max_datagram]u8 = undefined;
-        const reqlen = try proto.encodeRequest(&req, .{ .id = id, .op = op, .key = key, .value = value });
+        const reqlen = try proto.encodeRequest(&req, .{ .id = id, .op = op, .key = key, .value = value, .ttl_ms = ttl_ms });
 
         var attempt: u32 = 0;
         while (attempt < self.retries) : (attempt += 1) {
             _ = c.sendto(self.fd, &req, reqlen, 0, @ptrCast(&self.server), @sizeOf(posix.sockaddr.in));
+            const deadline = nowMs() + self.backoffMs(attempt);
             while (true) {
+                const remaining = deadline -| nowMs();
+                if (remaining == 0 or !self.readable(@intCast(remaining))) break; // retransmit
                 const got = c.recvfrom(self.fd, resp_buf.ptr, resp_buf.len, 0, null, null);
-                if (got <= 0) break; // receive timed out: retransmit
+                if (got <= 0) break;
                 const r = proto.decodeResponse(resp_buf[0..@intCast(got)]) catch continue;
                 if (r.id == id) return r; // a different id is a stale reply or a push: keep waiting
             }
@@ -146,6 +190,55 @@ pub const Client = struct {
         return error.Timeout;
     }
 };
+
+/// A queue of operations sent together in one datagram. The total queued size must fit one value
+/// (16 KiB), as must the combined results, so batches are for many small operations.
+pub const Batch = struct {
+    client: *Client,
+    body: [proto.max_value]u8 = undefined,
+    len: usize = 0,
+
+    pub fn set(self: *Batch, key: []const u8, value: []const u8) !void {
+        try self.add(.set, key, value, 0);
+    }
+    pub fn setEx(self: *Batch, key: []const u8, value: []const u8, ttl_ms: u32) !void {
+        try self.add(.set, key, value, ttl_ms);
+    }
+    pub fn get(self: *Batch, key: []const u8) !void {
+        try self.add(.get, key, "", 0);
+    }
+    pub fn del(self: *Batch, key: []const u8) !void {
+        try self.add(.del, key, "", 0);
+    }
+
+    fn add(self: *Batch, op: proto.Op, key: []const u8, value: []const u8, ttl_ms: u32) !void {
+        self.len = try proto.appendSubRequest(&self.body, self.len, .{ .op = op, .key = key, .value = value, .ttl_ms = ttl_ms });
+    }
+
+    /// Send the queued operations and return an iterator over their results, in queue order. The
+    /// results reference `resp_buf`, which must outlive the iteration.
+    pub fn send(self: *Batch, resp_buf: []u8) !Results {
+        const r = try self.client.roundtrip(.batch, "", self.body[0..self.len], 0, resp_buf);
+        if (r.status != .ok) return error.ServerError;
+        return .{ .reader = .{ .buf = r.value } };
+    }
+};
+
+/// An iterator over a batch's results. Each `next` is one `SubResult`, in the order operations were
+/// queued. The `value` of a get result is the stored value, or empty for a miss.
+pub const Results = struct {
+    reader: proto.SubResultReader,
+
+    pub fn next(self: *Results) ?proto.SubResult {
+        return self.reader.next();
+    }
+};
+
+fn nowMs() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1_000_000;
+}
 
 fn parseIp4(s: []const u8) !u32 {
     var octets: [4]u8 = undefined;

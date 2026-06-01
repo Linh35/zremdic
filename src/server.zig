@@ -22,11 +22,27 @@ pub const Options = struct {
     recv_buf_bytes: c_int = 4 << 20,
 };
 
+// Per-worker counters. Each worker is the only writer of its own counters, so the increments are
+// uncontended and the only sharing is the relaxed read a STATS request does to sum them.
+const WorkerStats = struct {
+    gets: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    sets: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    dels: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    misses: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    pushes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    fn bump(field: *std.atomic.Value(u64), by: u64) void {
+        if (by != 0) _ = field.fetchAdd(by, .monotonic);
+    }
+};
+
 pub const Server = struct {
     gpa: Allocator,
     store: Store,
     sockets: []c.fd_t,
     workers: []std.Thread,
+    worker_stats: []WorkerStats,
     addr: Addr,
     running: std.atomic.Value(bool),
     started: bool = false,
@@ -54,11 +70,15 @@ pub const Server = struct {
         errdefer store.deinit();
         if (opts.capacity > 0) try store.reserve(opts.capacity);
 
+        const stats = try gpa.alloc(WorkerStats, n);
+        for (stats) |*s| s.* = .{};
+
         return .{
             .gpa = gpa,
             .store = store,
             .sockets = sockets,
             .workers = try gpa.alloc(std.Thread, n),
+            .worker_stats = stats,
             .addr = addr,
             .running = std.atomic.Value(bool).init(false),
         };
@@ -70,6 +90,7 @@ pub const Server = struct {
         for (self.sockets) |s| _ = c.close(s);
         self.gpa.free(self.sockets);
         self.gpa.free(self.workers);
+        self.gpa.free(self.worker_stats);
         self.store.deinit();
     }
 
@@ -81,8 +102,8 @@ pub const Server = struct {
     /// Spawn the worker threads and begin serving.
     pub fn start(self: *Server) !void {
         self.running.store(true, .release);
-        for (self.workers, self.sockets) |*w, sock| {
-            w.* = try std.Thread.spawn(.{}, worker, .{ self, sock });
+        for (self.workers, self.sockets, self.worker_stats) |*w, sock, *stats| {
+            w.* = try std.Thread.spawn(.{}, worker, .{ self, sock, stats });
         }
         self.started = true;
     }
@@ -99,7 +120,7 @@ pub const Server = struct {
         for (self.workers) |w| w.join();
     }
 
-    fn worker(self: *Server, sock: c.fd_t) void {
+    fn worker(self: *Server, sock: c.fd_t, stats: *WorkerStats) void {
         var rbuf: [proto.max_datagram]u8 = undefined;
         var sbuf: [proto.max_datagram]u8 = undefined;
         var pbuf: [proto.max_datagram]u8 = undefined;
@@ -112,35 +133,19 @@ pub const Server = struct {
             if (got <= 0) continue; // a receive timeout lets the loop notice a stop request
             const req = proto.decodeRequest(rbuf[0..@intCast(got)]) catch continue;
 
-            const reply = self.apply(req, from, &sbuf, &pbuf, &subs, sock) catch continue;
+            const reply = self.apply(req, from, &sbuf, &pbuf, &subs, sock, stats) catch continue;
             if (reply > 0) _ = c.sendto(sock, &sbuf, reply, 0, @ptrCast(&from), flen);
         }
     }
 
     // Apply one request, write its reply into `sbuf`, and return the reply length (0 means no reply).
-    fn apply(self: *Server, req: proto.Request, from: Addr, sbuf: []u8, pbuf: []u8, subs: []Addr, sock: c.fd_t) !usize {
+    fn apply(self: *Server, req: proto.Request, from: Addr, sbuf: []u8, pbuf: []u8, subs: []Addr, sock: c.fd_t, stats: *WorkerStats) !usize {
         switch (req.op) {
             .ping => return try proto.encodeResponse(sbuf, .{ .id = req.id, .status = .ok }),
-            .get => {
+            .get, .set, .del => {
                 var vbuf: [proto.max_value]u8 = undefined;
-                if (self.store.get(req.key, &vbuf)) |len| {
-                    return try proto.encodeResponse(sbuf, .{ .id = req.id, .status = .ok, .value = vbuf[0..len] });
-                }
-                return try proto.encodeResponse(sbuf, .{ .id = req.id, .status = .not_found });
-            },
-            .set => {
-                if (req.key.len > proto.max_key or req.value.len > proto.max_value) {
-                    return try proto.encodeResponse(sbuf, .{ .id = req.id, .status = .too_large });
-                }
-                self.store.set(req.key, req.value) catch {
-                    return try proto.encodeResponse(sbuf, .{ .id = req.id, .status = .bad_request });
-                };
-                self.pushChange(req.key, req.value, pbuf, subs, sock);
-                return try proto.encodeResponse(sbuf, .{ .id = req.id, .status = .ok });
-            },
-            .del => {
-                _ = self.store.del(req.key);
-                return try proto.encodeResponse(sbuf, .{ .id = req.id, .status = .ok });
+                const res = self.applySub(.{ .op = req.op, .key = req.key, .value = req.value, .ttl_ms = req.ttl_ms }, &vbuf, pbuf, subs, sock, stats);
+                return try proto.encodeResponse(sbuf, .{ .id = req.id, .status = res.status, .value = res.value });
             },
             .subscribe => {
                 self.store.subscribe(req.key, from) catch {};
@@ -150,18 +155,84 @@ pub const Server = struct {
                 self.store.unsubscribe(req.key, from);
                 return try proto.encodeResponse(sbuf, .{ .id = req.id, .status = .ok });
             },
+            .stats => {
+                var sbytes: [proto.stats_size]u8 = undefined;
+                proto.encodeStats(&sbytes, self.snapshotStats());
+                return try proto.encodeResponse(sbuf, .{ .id = req.id, .status = .ok, .value = &sbytes });
+            },
+            .batch => {
+                var body: [proto.max_value]u8 = undefined;
+                var vbuf: [proto.max_value]u8 = undefined;
+                var pos: usize = 0;
+                var reader = proto.SubRequestReader{ .buf = req.value };
+                while (reader.next()) |sub| {
+                    const res = self.applySub(sub, &vbuf, pbuf, subs, sock, stats);
+                    pos = proto.appendSubResult(&body, pos, res) catch break; // result body is full
+                }
+                return try proto.encodeResponse(sbuf, .{ .id = req.id, .status = .ok, .value = body[0..pos] });
+            },
             .update => return 0, // a server-to-client message; clients never send it
         }
     }
 
-    // Push the new value of `key` to its subscribers as an `update` datagram.
-    fn pushChange(self: *Server, key: []const u8, value: []const u8, pbuf: []u8, subs: []Addr, sock: c.fd_t) void {
+    // Apply one get, set, or del, writing any returned value into `vbuf`. Used for both single
+    // requests and the entries of a batch. Counts the operation and pushes changes to subscribers.
+    fn applySub(self: *Server, sub: proto.SubRequest, vbuf: []u8, pbuf: []u8, subs: []Addr, sock: c.fd_t, stats: *WorkerStats) proto.SubResult {
+        switch (sub.op) {
+            .get => {
+                WorkerStats.bump(&stats.gets, 1);
+                if (self.store.get(sub.key, vbuf)) |len| {
+                    WorkerStats.bump(&stats.hits, 1);
+                    return .{ .status = .ok, .value = vbuf[0..len] };
+                }
+                WorkerStats.bump(&stats.misses, 1);
+                return .{ .status = .not_found };
+            },
+            .set => {
+                if (sub.key.len > proto.max_key or sub.value.len > proto.max_value) return .{ .status = .too_large };
+                self.store.set(sub.key, sub.value, sub.ttl_ms) catch return .{ .status = .bad_request };
+                WorkerStats.bump(&stats.sets, 1);
+                WorkerStats.bump(&stats.pushes, self.pushChange(sub.key, sub.value, pbuf, subs, sock));
+                return .{ .status = .ok };
+            },
+            .del => {
+                WorkerStats.bump(&stats.dels, 1);
+                if (self.store.del(sub.key)) {
+                    // tell watchers the key is gone: an update with an empty value
+                    WorkerStats.bump(&stats.pushes, self.pushChange(sub.key, "", pbuf, subs, sock));
+                }
+                return .{ .status = .ok };
+            },
+            else => return .{ .status = .bad_request }, // only get, set, and del are valid in a batch
+        }
+    }
+
+    // Push `value` for `key` to its subscribers as an `update` datagram. Returns the number sent.
+    fn pushChange(self: *Server, key: []const u8, value: []const u8, pbuf: []u8, subs: []Addr, sock: c.fd_t) u64 {
         const n = self.store.subscribersOf(key, subs);
-        if (n == 0) return;
-        const len = proto.encodeRequest(pbuf, .{ .id = 0, .op = .update, .key = key, .value = value }) catch return;
+        if (n == 0) return 0;
+        const len = proto.encodeRequest(pbuf, .{ .id = 0, .op = .update, .key = key, .value = value }) catch return 0;
         for (subs[0..n]) |*addr| {
             _ = c.sendto(sock, pbuf.ptr, len, 0, @ptrCast(addr), @sizeOf(Addr));
         }
+        return n;
+    }
+
+    // Sum the workers' counters and read the live key and subscriber counts from the store.
+    fn snapshotStats(self: *Server) proto.Stats {
+        var s: proto.Stats = .{};
+        for (self.worker_stats) |*w| {
+            s.gets += w.gets.load(.monotonic);
+            s.sets += w.sets.load(.monotonic);
+            s.dels += w.dels.load(.monotonic);
+            s.hits += w.hits.load(.monotonic);
+            s.misses += w.misses.load(.monotonic);
+            s.pushes += w.pushes.load(.monotonic);
+        }
+        s.expired = self.store.expiredCount();
+        s.keys = self.store.count();
+        s.subscribers = self.store.subscriberCount();
+        return s;
     }
 };
 
@@ -173,6 +244,7 @@ fn bindSocket(addr: *const Addr, recv_buf_bytes: c_int) !c.fd_t {
     setOpt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, @as(c_int, 1));
     setOpt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, @as(c_int, 1));
     setOpt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, recv_buf_bytes);
+    setOpt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, recv_buf_bytes); // also lets large replies leave
     // A receive timeout so a worker blocked in recvfrom wakes up to see a stop request.
     setOpt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, posix.timeval{ .sec = 0, .usec = 200 * 1000 });
 
