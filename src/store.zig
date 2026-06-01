@@ -75,6 +75,17 @@ pub const Store = struct {
         return total;
     }
 
+    /// Pre-size every shard's table for roughly `total` keys spread evenly, so the store does not
+    /// rehash as it fills toward that size.
+    pub fn reserve(self: *Store, total: usize) !void {
+        const per: u32 = @intCast(total / self.shards.len + 1);
+        for (self.shards) |*s| {
+            s.mutex.lock();
+            defer s.mutex.unlock();
+            try s.map.ensureTotalCapacity(s.gpa, per);
+        }
+    }
+
     /// Register `addr` to be notified when `key` changes. Idempotent per address; drops the
     /// registration if the key already has `max_subscribers`.
     pub fn subscribe(self: *Store, key: []const u8, addr: Addr) !void {

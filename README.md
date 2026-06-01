@@ -34,7 +34,18 @@ zig build example      # a runnable tour of the client API against an in-process
 zig build bench        # a loopback throughput and latency benchmark
 ```
 
-The server binary binds `0.0.0.0:6380`, uses one worker thread per CPU, and serves until stopped.
+The server binary takes optional positional arguments for its initial size:
+
+```sh
+zremdic-server [port] [threads] [shards] [capacity]
+```
+
+- `port` to bind on `0.0.0.0` (default 6380)
+- `threads`, one worker socket each (default: CPU count)
+- `shards`, the store's concurrency width (default 64)
+- `capacity`, the number of keys to pre-size the store for so it does not rehash as it fills (default 0, grow on demand)
+
+With no arguments it binds `0.0.0.0:6380`, runs one worker thread per CPU, and serves until stopped. Through `zig build`, pass arguments after `--`, as in `zig build run -- 6380 8 128 1000000`.
 
 ## The store
 

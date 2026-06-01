@@ -16,6 +16,9 @@ pub const Options = struct {
     port: u16 = 6380,
     threads: usize = 1,
     shards: usize = 16,
+    /// Pre-size the store for roughly this many keys, so it does not rehash as it fills. Zero
+    /// leaves the store to grow on demand.
+    capacity: usize = 0,
     recv_buf_bytes: c_int = 4 << 20,
 };
 
@@ -47,9 +50,13 @@ pub const Server = struct {
         _ = c.getsockname(sockets[0], @ptrCast(&addr), &len);
         for (sockets[1..]) |*s| s.* = try bindSocket(&addr, opts.recv_buf_bytes);
 
+        var store = try Store.init(gpa, opts.shards);
+        errdefer store.deinit();
+        if (opts.capacity > 0) try store.reserve(opts.capacity);
+
         return .{
             .gpa = gpa,
-            .store = try Store.init(gpa, opts.shards),
+            .store = store,
             .sockets = sockets,
             .workers = try gpa.alloc(std.Thread, n),
             .addr = addr,
