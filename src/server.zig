@@ -4,12 +4,19 @@
 //! address subscribed to that key.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const c = std.c;
 const posix = std.posix;
+const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
 const proto = @import("proto.zig");
 const Store = @import("store.zig").Store;
 const Addr = @import("store.zig").Addr;
+const max_subscribers = @import("store.zig").max_subscribers;
+
+// On Linux a worker receives and replies to a whole batch of datagrams per syscall with recvmmsg and
+// sendmmsg. Elsewhere it falls back to one recvfrom and one sendto per datagram.
+const recv_batch = 16;
 
 pub const Options = struct {
     ip: []const u8 = "0.0.0.0",
@@ -121,28 +128,105 @@ pub const Server = struct {
     }
 
     fn worker(self: *Server, sock: c.fd_t, stats: *WorkerStats) void {
+        comptime {
+            _ = &workerBatched; // keep the Linux path type-checked when building for other targets
+        }
+        if (builtin.os.tag == .linux) {
+            // The batched loop only errors if it cannot allocate its buffers; then fall back below.
+            self.workerBatched(sock, stats) catch {};
+            if (!self.running.load(.acquire)) return;
+        }
+        self.workerSimple(sock, stats);
+    }
+
+    // One recvfrom and one sendto per datagram. The portable path, and the fallback on Linux.
+    fn workerSimple(self: *Server, sock: c.fd_t, stats: *WorkerStats) void {
         var rbuf: [proto.max_datagram]u8 = undefined;
         var sbuf: [proto.max_datagram]u8 = undefined;
         var pbuf: [proto.max_datagram]u8 = undefined;
-        var subs: [@import("store.zig").max_subscribers]Addr = undefined;
+        var subs: [max_subscribers]Addr = undefined;
 
         while (self.running.load(.acquire)) {
             var from: Addr = undefined;
             var flen: posix.socklen_t = @sizeOf(Addr);
             const got = c.recvfrom(sock, &rbuf, rbuf.len, 0, @ptrCast(&from), &flen);
             if (got <= 0) continue; // a receive timeout lets the loop notice a stop request
-            const req = proto.decodeRequest(rbuf[0..@intCast(got)]) catch continue;
-
-            const reply = self.apply(req, from, &sbuf, &pbuf, &subs, sock, stats) catch continue;
+            const reply = self.handleOne(rbuf[0..@intCast(got)], &sbuf, &pbuf, &subs, from, sock, stats);
             if (reply > 0) _ = c.sendto(sock, &sbuf, reply, 0, @ptrCast(&from), flen);
         }
+    }
+
+    // Receive up to `recv_batch` datagrams per recvmmsg, build their replies, and send them with one
+    // sendmmsg. Each received datagram has its own receive and send slot, so the reply for slot i is
+    // assembled in place while the others are still being handled. Returns an error only if the
+    // per-worker buffers cannot be allocated, leaving the caller to use the simple path.
+    fn workerBatched(self: *Server, sock: c.fd_t, stats: *WorkerStats) !void {
+        const gpa = self.gpa;
+        const rstore = try gpa.alloc(u8, recv_batch * proto.max_datagram);
+        defer gpa.free(rstore);
+        const sstore = try gpa.alloc(u8, recv_batch * proto.max_datagram);
+        defer gpa.free(sstore);
+        const addrs = try gpa.alloc(Addr, recv_batch);
+        defer gpa.free(addrs);
+        const riov = try gpa.alloc(posix.iovec, recv_batch);
+        defer gpa.free(riov);
+        const siov = try gpa.alloc(posix.iovec, recv_batch);
+        defer gpa.free(siov);
+        const rmsg = try gpa.alloc(linux.mmsghdr, recv_batch);
+        defer gpa.free(rmsg);
+        const smsg = try gpa.alloc(linux.mmsghdr, recv_batch);
+        defer gpa.free(smsg);
+        var pbuf: [proto.max_datagram]u8 = undefined;
+        var subs: [max_subscribers]Addr = undefined;
+
+        // The receive vector is set up once: slot i reads into its own buffer and records its sender.
+        for (riov, 0..) |*v, i| v.* = .{ .base = rstore[i * proto.max_datagram ..].ptr, .len = proto.max_datagram };
+        for (rmsg, 0..) |*m, i| m.* = .{ .hdr = msghdrFor(&addrs[i], riov[i..][0..1].ptr), .len = 0 };
+
+        while (self.running.load(.acquire)) {
+            for (rmsg) |*m| m.hdr.namelen = @sizeOf(Addr); // recvmmsg overwrites this; reset each round
+            var ts: linux.timespec = .{ .sec = 0, .nsec = 200 * std.time.ns_per_ms }; // wake to see a stop
+            const ret = linux.recvmmsg(sock, rmsg.ptr, recv_batch, linux.MSG.WAITFORONE, &ts);
+            if (linux.errno(ret) != .SUCCESS) continue;
+
+            var nsend: usize = 0;
+            var i: usize = 0;
+            while (i < ret) : (i += 1) {
+                const rbuf = rstore[i * proto.max_datagram ..][0..rmsg[i].len];
+                const sslot = sstore[i * proto.max_datagram ..][0..proto.max_datagram];
+                const reply = self.handleOne(rbuf, sslot, &pbuf, &subs, addrs[i], sock, stats);
+                if (reply == 0) continue;
+                siov[nsend] = .{ .base = sslot.ptr, .len = reply };
+                smsg[nsend] = .{ .hdr = msghdrFor(&addrs[i], siov[nsend..][0..1].ptr), .len = 0 };
+                nsend += 1;
+            }
+            if (nsend > 0) _ = linux.sendmmsg(sock, smsg.ptr, @intCast(nsend), 0);
+        }
+    }
+
+    // Decode one request, apply it, and write any reply into `sbuf`. Returns the reply length, or 0
+    // for a malformed datagram or an op that sends nothing back.
+    fn handleOne(self: *Server, rbuf: []const u8, sbuf: []u8, pbuf: []u8, subs: []Addr, from: Addr, sock: c.fd_t, stats: *WorkerStats) usize {
+        const req = proto.decodeRequest(rbuf) catch return 0;
+        return self.apply(req, from, sbuf, pbuf, subs, sock, stats) catch 0;
     }
 
     // Apply one request, write its reply into `sbuf`, and return the reply length (0 means no reply).
     fn apply(self: *Server, req: proto.Request, from: Addr, sbuf: []u8, pbuf: []u8, subs: []Addr, sock: c.fd_t, stats: *WorkerStats) !usize {
         switch (req.op) {
             .ping => return try proto.encodeResponse(sbuf, .{ .id = req.id, .status = .ok }),
-            .get, .set, .del => {
+            .get => {
+                // Single-copy read: the store writes the value straight after the reply header in
+                // `sbuf`, then the header is stamped in front of it, with no intermediate buffer.
+                WorkerStats.bump(&stats.gets, 1);
+                if (self.store.get(req.key, sbuf[proto.resp_header..])) |len| {
+                    WorkerStats.bump(&stats.hits, 1);
+                    return try proto.finishResponse(sbuf, req.id, .ok, len);
+                }
+                WorkerStats.bump(&stats.misses, 1);
+                return try proto.finishResponse(sbuf, req.id, .not_found, 0);
+            },
+            .set, .del => {
                 var vbuf: [proto.max_value]u8 = undefined;
                 const res = self.applySub(.{ .op = req.op, .key = req.key, .value = req.value, .ttl_ms = req.ttl_ms }, &vbuf, pbuf, subs, sock, stats);
                 return try proto.encodeResponse(sbuf, .{ .id = req.id, .status = res.status, .value = res.value });
@@ -235,6 +319,19 @@ pub const Server = struct {
         return s;
     }
 };
+
+// Build a message header pointing at one address and a single-entry iovec, for recvmmsg or sendmmsg.
+fn msghdrFor(name: *Addr, iov: [*]posix.iovec) linux.msghdr {
+    return .{
+        .name = @ptrCast(name),
+        .namelen = @sizeOf(Addr),
+        .iov = iov,
+        .iovlen = 1,
+        .control = null,
+        .controllen = 0,
+        .flags = 0,
+    };
+}
 
 fn bindSocket(addr: *const Addr, recv_buf_bytes: c_int) !c.fd_t {
     const fd = c.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);

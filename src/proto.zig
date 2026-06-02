@@ -24,7 +24,7 @@ pub const Op = enum(u8) {
 pub const Status = enum(u8) { ok = 0, not_found = 1, too_large = 2, bad_request = 3 };
 
 const req_header = 15; // id(4) op(1) key_len(2) val_len(4) ttl_ms(4)
-const resp_header = 9; // id(4) status(1) val_len(4)
+pub const resp_header = 9; // id(4) status(1) val_len(4)
 
 pub const Request = struct {
     id: u32,
@@ -81,6 +81,19 @@ pub fn encodeResponse(buf: []u8, r: Response) EncodeError!usize {
     buf[4] = @intFromEnum(r.status);
     std.mem.writeInt(u32, buf[5..9], @intCast(r.value.len), .little);
     @memcpy(buf[resp_header..][0..r.value.len], r.value);
+    return total;
+}
+
+/// Write a response header in place for a value already sitting at `buf[resp_header..][0..val_len]`,
+/// returning the datagram length. This lets a get reply be assembled with no intermediate copy: the
+/// store writes the value straight into the reply datagram and this stamps the header in front of it.
+pub fn finishResponse(buf: []u8, id: u32, status: Status, val_len: usize) EncodeError!usize {
+    if (val_len > max_value) return error.ValueTooLong;
+    const total = resp_header + val_len;
+    if (buf.len < total) return error.BufferTooSmall;
+    std.mem.writeInt(u32, buf[0..4], id, .little);
+    buf[4] = @intFromEnum(status);
+    std.mem.writeInt(u32, buf[5..9], @intCast(val_len), .little);
     return total;
 }
 
@@ -251,6 +264,17 @@ test "response round-trips, including an empty value" {
     const e = try decodeResponse(buf[0..m]);
     try testing.expectEqual(Status.not_found, e.status);
     try testing.expectEqual(@as(usize, 0), e.value.len);
+}
+
+test "a response assembled in place decodes the same as an encoded one" {
+    var buf: [max_datagram]u8 = undefined;
+    const value = "in place";
+    @memcpy(buf[resp_header..][0..value.len], value);
+    const n = try finishResponse(&buf, 99, .ok, value.len);
+    const r = try decodeResponse(buf[0..n]);
+    try testing.expectEqual(@as(u32, 99), r.id);
+    try testing.expectEqual(Status.ok, r.status);
+    try testing.expectEqualStrings(value, r.value);
 }
 
 test "stats round-trip" {
