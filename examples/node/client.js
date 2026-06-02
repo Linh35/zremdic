@@ -6,13 +6,19 @@
 
 const dgram = require("node:dgram");
 
-const OP = { get: 1, set: 2, del: 3, ping: 4, subscribe: 5, unsubscribe: 6, update: 7, stats: 8, batch: 9 };
+const OP = {
+  get: 1, set: 2, del: 3, ping: 4, subscribe: 5, unsubscribe: 6, update: 7, stats: 8, batch: 9,
+  incrby: 10, append: 11, setnx: 12, cas: 13, getset: 14, getdel: 15,
+};
 const STATUS = { ok: 0, not_found: 1, too_large: 2, bad_request: 3 };
 const REQ_HEADER = 15; // id(4) op(1) key_len(2) val_len(4) ttl(4)
 const RESP_HEADER = 9; // id(4) status(1) val_len(4)
 const SUB_REQ_HEADER = 11; // op(1) key_len(2) val_len(4) ttl(4)
 const SUB_RES_HEADER = 5; // status(1) val_len(4)
-const STATS_FIELDS = ["gets", "sets", "dels", "hits", "misses", "pushes", "expired", "keys", "subscribers"];
+const STATS_FIELDS = [
+  "gets", "sets", "dels", "hits", "misses", "pushes",
+  "expired", "evicted", "keys", "bytes", "subscribers", "dedup_hits",
+];
 
 class ZremdicClient {
   constructor(host = "127.0.0.1", port = 6380, { timeoutMs = 200, retries = 3, backoffCapMs = 2000 } = {}) {
@@ -76,6 +82,69 @@ class ZremdicClient {
       const s = {};
       STATS_FIELDS.forEach((name, i) => (s[name] = Number(r.value.readBigUInt64LE(i * 8))));
       return s;
+    });
+  }
+
+  // Atomic operations. Each mutates based on the current value, so the server deduplicates
+  // retransmits by the request id, making them apply exactly once over UDP.
+  incrBy(key, delta) {
+    const d = Buffer.allocUnsafe(8);
+    d.writeBigInt64LE(BigInt(delta), 0);
+    return this._request(OP.incrby, key, d).then((r) => {
+      if (r.status !== STATUS.ok) throw new Error("zremdic: value is not an integer");
+      return Number(r.value.toString("utf8"));
+    });
+  }
+  incr(key) {
+    return this.incrBy(key, 1);
+  }
+  decr(key) {
+    return this.incrBy(key, -1);
+  }
+  decrBy(key, delta) {
+    return this.incrBy(key, -delta);
+  }
+  append(key, suffix) {
+    return this._request(OP.append, key, suffix).then((r) => {
+      if (r.status === STATUS.too_large) throw new Error("zremdic: value too large");
+      expectOk(r);
+      return Number(r.value.toString("utf8"));
+    });
+  }
+  setNx(key, value, ttlMs = 0) {
+    return this._request(OP.setnx, key, value, ttlMs).then((r) => {
+      if (r.status === STATUS.too_large) throw new Error("zremdic: value too large");
+      expectOk(r);
+      return r.value.toString("utf8") === "1";
+    });
+  }
+  // Set newValue only if the current value equals expected. Returns whether it swapped.
+  cas(key, expected, newValue, ttlMs = 0) {
+    const e = Buffer.from(expected);
+    const nv = Buffer.from(newValue);
+    const v = Buffer.allocUnsafe(4 + e.length + nv.length);
+    v.writeUInt32LE(e.length, 0);
+    e.copy(v, 4);
+    nv.copy(v, 4 + e.length);
+    return this._request(OP.cas, key, v, ttlMs).then((r) => {
+      if (r.status === STATUS.too_large) throw new Error("zremdic: value too large");
+      expectOk(r);
+      return r.value.toString("utf8") === "1";
+    });
+  }
+  getSet(key, newValue) {
+    return this._request(OP.getset, key, newValue).then((r) => {
+      if (r.status === STATUS.not_found) return null;
+      if (r.status === STATUS.too_large) throw new Error("zremdic: value too large");
+      expectOk(r);
+      return r.value.toString("utf8");
+    });
+  }
+  getDel(key) {
+    return this._request(OP.getdel, key).then((r) => {
+      if (r.status === STATUS.not_found) return null;
+      expectOk(r);
+      return r.value.toString("utf8");
     });
   }
 
@@ -244,6 +313,16 @@ if (require.main === module) {
 
     const results = await c.batch().set("a", "1").set("b", "2").get("a").get("nope").send();
     console.log("batch results:", results.map((r) => ({ status: r.status, value: r.value.toString() })));
+
+    // Atomic ops: a counter, a setnx/cas lock, and getset/getdel.
+    console.log("incr count  =", await c.incr("count"));
+    console.log("incr by 9   =", await c.incrBy("count", 9));
+    console.log("append len  =", await c.append("log", "line\n"));
+    console.log("acquired    =", await c.setNx("leader", "node-a", 3000));
+    console.log("acquired 2  =", await c.setNx("leader", "node-b", 3000)); // false
+    console.log("refreshed   =", await c.cas("leader", "node-a", "node-a", 3000));
+    console.log("getset old  =", await c.getSet("count", "0"));
+    console.log("getdel old  =", JSON.stringify(await c.getDel("log")));
 
     console.log("stats:", await c.stats());
 

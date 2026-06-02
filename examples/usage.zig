@@ -36,6 +36,21 @@ pub fn main() !void {
         std.debug.print("batch[{d}]     = status {d}, value '{s}'\n", .{ i, @intFromEnum(r.status), r.value });
     }
 
+    // Atomic operations. These mutate based on the current value, so the client gives each a request
+    // id and the server deduplicates retransmits, making a counter increment exactly once over UDP.
+    std.debug.print("incr count   = {d}\n", .{try client.incr("count")});
+    std.debug.print("incr by 9    = {d}\n", .{try client.incrBy("count", 9)});
+    std.debug.print("append len   = {d}\n", .{try client.append("log", "line\n")});
+
+    // A lock with setnx plus a ttl, refreshed or released with cas. This is the leader-election shape.
+    std.debug.print("acquired     = {}\n", .{try client.setNx("leader", "node-a", 3000)});
+    std.debug.print("acquired 2nd = {}\n", .{try client.setNx("leader", "node-b", 3000)}); // false
+    std.debug.print("swapped      = {}\n", .{try client.cas("leader", "node-a", "node-a", 3000)}); // refresh
+
+    var prev: [64]u8 = undefined;
+    std.debug.print("getset old   = {?s}\n", .{try client.getSet("count", "0", &prev)});
+    std.debug.print("getdel old   = {?s}\n", .{try client.getDel("log", &prev)});
+
     // A watcher is pushed the new value whenever the key changes. Pushes are best effort, so dedupe
     // by remembering the last value and treat a push as a hint to read the key when it matters.
     var watcher = try zremdic.Client.init("127.0.0.1", port, .{ .timeout_ms = 500 });
