@@ -53,7 +53,7 @@ Keys and values are bytes. A key is at most 256 bytes and a value at most 16 KiB
 
 A set may carry a time to live in milliseconds. The key then expires that long after the write, and the first read past the deadline finds it gone and drops it. Expiry is lazy, so it costs nothing for keys that have no TTL.
 
-The keyspace is split into shards by key hash, each shard a hash map behind its own spinlock. Worker threads contend only when they touch the same shard, and a reader copies the value out under the lock, so it never observes memory a writer is freeing. More shards means less contention; the server binary uses 64. `initCapacity` or the server's `capacity` argument pre-sizes the shards so the store does not rehash as it fills.
+The keyspace is split into shards by key hash, each shard a hash map behind its own spinlock. Worker threads contend only when they touch the same shard, and a reader copies the value out under the lock, so it never observes memory a writer is freeing. More shards means less contention; the server binary uses 64. The shard count is rounded up to a power of two, so a key maps to its shard with a single bit-and rather than a modulo. The server's `capacity` argument pre-sizes the shards so the store does not rehash as it fills.
 
 ## Watching a key
 
@@ -75,7 +75,7 @@ A delete pushes too, with an empty value, so a watcher learns the key is gone. P
 
 ## The client
 
-`Client.init(ip, port, options)` opens a UDP socket. Options are `timeout_ms` (default 200, the first wait before a retransmit), `retries` (default 3), and `backoff_cap_ms` (default 2000). Each call sends one request and waits for the reply with the matching id. If the wait elapses it retransmits, doubling the wait each attempt up to the cap and adding jitter, so a busy server is not buried under synchronized retries. Because get, set, and del are idempotent, a retransmit is harmless.
+`Client.init(ip, port, options)` opens a UDP socket and connects it to the server, so each call uses send and recv with no per-call address and the kernel drops datagrams from any other host. Options are `timeout_ms` (default 200, the first wait before a retransmit), `retries` (default 3), and `backoff_cap_ms` (default 2000). Each call sends one request and waits for the reply with the matching id. If the wait elapses it retransmits, doubling the wait each attempt up to the cap and adding jitter, so a busy server is not buried under synchronized retries. Because get, set, and del are idempotent, a retransmit is harmless.
 
 - `ping() !void`
 - `set(key, value) !void`, errors `error.TooLarge` if over the limits
@@ -166,11 +166,11 @@ A `batch` request's value is a sequence of sub-requests, each `op(1) key_len(2) 
 From `zig build bench -Doptimize=ReleaseFast` on an Apple M3 over loopback, with four client threads and four server threads:
 
 ```
-800000 round trips in ~4.5s
-~180000 ops/sec, ~22 us average round trip
+800000 round trips in ~3.8s
+~210000 ops/sec, ~19 us average round trip
 ```
 
-Each client runs its operations one at a time, so this measures round-trip latency, which on loopback is dominated by the four socket syscalls and the thread wakeup per round trip. On a real network the round trip is dominated by the network itself. Two things raise throughput. Aggregate rises with the number of concurrent clients and server threads, because `SO_REUSEPORT` lets the kernel spread datagrams across the worker sockets. And a batch pays one round trip for many operations, so a batch of twenty small operations does roughly twenty times the work of one operation for the same latency.
+Each client runs its operations one at a time, so this measures round-trip latency, which on loopback is dominated by the socket syscalls and the thread wakeup per round trip. On a real network the round trip is dominated by the network itself. Three things raise throughput. Aggregate rises with the number of concurrent clients and server threads, because `SO_REUSEPORT` lets the kernel spread datagrams across the worker sockets. On Linux each worker receives and replies to a batch of datagrams per syscall with `recvmmsg` and `sendmmsg`, which cuts the syscall count under load. And a batch pays one round trip for many operations, so a batch of twenty small operations does roughly twenty times the work of one operation for the same latency.
 
 ## Handling the rough edges
 
@@ -184,7 +184,7 @@ A large value fragments. On a low-loss network that is fine; under heavy loss it
 
 ## Scaling and what is next
 
-The server already binds one socket per worker with `SO_REUSEPORT` and shards the store, so it uses every core, and batching lets a client amortize the round trip over many operations. The next steps for higher packet rates, in order of payoff, are `recvmmsg` and `sendmmsg` to handle many datagrams per syscall on Linux, larger socket buffers under bursty load, and a single-copy get path that writes the stored value straight into the reply datagram. Horizontal scale beyond one box is client-side consistent hashing across several servers.
+The server binds one socket per worker with `SO_REUSEPORT` and shards the store, so it uses every core; on Linux each worker batches its receives and sends with `recvmmsg` and `sendmmsg`; a get writes the stored value straight into the reply datagram with no intermediate copy; a key maps to its shard with one bit-and rather than a modulo; and the client connects its socket so each call skips the per-call address and a route lookup. The remaining steps for higher packet rates are larger socket buffers under bursty load and, for read-heavy keys, a sequence-lock read path that lets readers avoid the shard lock. Horizontal scale beyond one box is client-side consistent hashing across several servers.
 
 A few limits are deliberate. There is no authentication, so bind it only to a trusted network. Values are capped at 16 KiB, and one over the MTU is sent fragmented. Operations that are not idempotent, such as a counter, would need server-side request deduplication before they could ride the same retransmitting client, so they are left out until that exists.
 
