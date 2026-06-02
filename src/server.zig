@@ -269,27 +269,59 @@ pub const Server = struct {
                 }
                 return try proto.encodeResponse(sbuf, .{ .id = req.id, .status = .ok, .value = body[0..pos] });
             },
-            .incrby, .append, .setnx, .cas, .getset, .getdel => return try self.applyMutating(req, from, sbuf, stats),
+            .incrby, .append, .setnx, .cas, .getset, .getdel => return try self.applyMutating(req, from, sbuf, pbuf, subs, sock, stats),
             .update => return 0, // a server-to-client message; clients never send it
         }
     }
 
     // Apply a non-idempotent op through the dedup cache so a retransmit replays the first reply
     // instead of mutating twice. Idempotent ops never reach here, so they pay nothing for dedup.
-    fn applyMutating(self: *Server, req: proto.Request, from: Addr, sbuf: []u8, stats: *WorkerStats) !usize {
+    fn applyMutating(self: *Server, req: proto.Request, from: Addr, sbuf: []u8, pbuf: []u8, subs: []Addr, sock: c.fd_t, stats: *WorkerStats) !usize {
         var vbuf: [proto.max_value]u8 = undefined;
         switch (self.dedup.lookup(from, req.id, &vbuf)) {
+            // A retransmit replays the first reply and does not push again; the change already fired.
             .hit => |r| return try proto.encodeResponse(sbuf, .{ .id = req.id, .status = r.status, .value = r.value }),
             .miss => |ticket| {
                 const res = self.runMutating(req, &vbuf, stats);
                 self.dedup.commit(ticket, res.status, vbuf[0..res.len]);
+                self.pushMutation(req, res, vbuf[0..res.len], pbuf, subs, sock, stats);
                 return try proto.encodeResponse(sbuf, .{ .id = req.id, .status = res.status, .value = vbuf[0..res.len] });
             },
         }
     }
 
-    // Run one non-idempotent op against the store, writing any reply value into `out`. These do not
-    // notify watchers; subscribe sees plain set and del.
+    // Notify watchers of a key's new value after a successful mutating op, the same best-effort push
+    // a set or del makes. The new value is known from the request for every op but append, which is
+    // re-read, and only when the key has a subscriber so the read is skipped otherwise.
+    fn pushMutation(self: *Server, req: proto.Request, res: store.OpResult, reply: []const u8, pbuf: []u8, subs: []Addr, sock: c.fd_t, stats: *WorkerStats) void {
+        const changed = switch (req.op) {
+            .incrby, .append => res.status == .ok,
+            .getset => res.status == .ok or res.status == .not_found, // getset always writes the new value
+            .getdel => res.status == .ok, // ok means the key existed and was removed
+            .setnx, .cas => reply.len == 1 and reply[0] == '1', // only when it actually set or swapped
+            else => false,
+        };
+        if (!changed) return;
+        const n = self.store.subscribersOf(req.key, subs);
+        if (n == 0) return;
+
+        var vbuf: [proto.max_value]u8 = undefined;
+        const value: []const u8 = switch (req.op) {
+            .incrby => reply, // the new counter is the new value
+            .getset, .setnx => req.value,
+            .cas => if (proto.decodeCasValue(req.value)) |cv| cv.new_value else return,
+            .getdel => "", // an empty value tells watchers the key is gone, as with del
+            .append => if (self.store.get(req.key, &vbuf)) |k| vbuf[0..k] else "",
+            else => return,
+        };
+        const len = proto.encodeRequest(pbuf, .{ .id = 0, .op = .update, .key = req.key, .value = value }) catch return;
+        for (subs[0..n]) |*addr| {
+            _ = c.sendto(sock, pbuf.ptr, len, 0, @ptrCast(addr), @sizeOf(Addr));
+        }
+        WorkerStats.bump(&stats.pushes, n);
+    }
+
+    // Run one non-idempotent op against the store, writing any reply value into `out`.
     fn runMutating(self: *Server, req: proto.Request, out: []u8, stats: *WorkerStats) store.OpResult {
         switch (req.op) {
             .incrby => {

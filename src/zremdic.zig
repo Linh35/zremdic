@@ -213,6 +213,47 @@ test "atomic operations over the wire" {
     try testing.expectError(error.NotANumber, client.incr("word"));
 }
 
+test "a watcher is notified when an atomic op changes a key" {
+    var server = try Server.init(testing.allocator, .{ .ip = "127.0.0.1", .port = 0, .threads = 2, .shards = 4 });
+    defer server.deinit();
+    try server.start();
+    const port = server.port();
+
+    var sub = try Client.init("127.0.0.1", port, .{ .timeout_ms = 800, .retries = 5 });
+    defer sub.deinit();
+    var writer = try Client.init("127.0.0.1", port, .{ .timeout_ms = 800, .retries = 5 });
+    defer writer.deinit();
+
+    var kbuf: [64]u8 = undefined;
+    var vbuf: [64]u8 = undefined;
+    var out: [16]u8 = undefined;
+
+    try sub.subscribe("hits");
+
+    // incr pushes the new counter
+    _ = try writer.incr("hits");
+    const up1 = (try sub.pollUpdate(&kbuf, &vbuf)) orelse return error.NoUpdate;
+    try testing.expectEqualStrings("hits", up1.key);
+    try testing.expectEqualStrings("1", up1.value);
+
+    // getdel pushes an empty value, the same signal del gives
+    _ = try writer.getDel("hits", &out);
+    const up2 = (try sub.pollUpdate(&kbuf, &vbuf)) orelse return error.NoUpdate;
+    try testing.expectEqualStrings("hits", up2.key);
+    try testing.expectEqual(@as(usize, 0), up2.value.len);
+
+    // append pushes the whole new value, not just the length it returns to the caller
+    _ = try writer.append("hits", "abc");
+    const up3 = (try sub.pollUpdate(&kbuf, &vbuf)) orelse return error.NoUpdate;
+    try testing.expectEqualStrings("abc", up3.value);
+
+    // a cas that does not swap is silent; one that swaps pushes the new value
+    _ = try writer.cas("hits", "wrong", "nope", 0); // no swap, no push
+    _ = try writer.cas("hits", "abc", "swapped", 0); // swaps
+    const up4 = (try sub.pollUpdate(&kbuf, &vbuf)) orelse return error.NoUpdate;
+    try testing.expectEqualStrings("swapped", up4.value);
+}
+
 test "the server evicts under a byte budget" {
     var server = try Server.init(testing.allocator, .{ .ip = "127.0.0.1", .port = 0, .threads = 1, .shards = 1, .max_bytes = 4096 });
     defer server.deinit();

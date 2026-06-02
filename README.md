@@ -60,7 +60,7 @@ The keyspace is split into shards by key hash, each shard a hash map behind its 
 
 ## Watching a key
 
-A client can ask to be told when a key changes. After `subscribe(key)`, every later `set` of that key makes the server push the new value to the subscriber as an `update` datagram. The client reads those with `pollUpdate`.
+A client can ask to be told when a key changes. After `subscribe(key)`, every later write to that key, whether a `set` or an atomic operation like `incr` or `cas`, makes the server push the new value to the subscriber as an `update` datagram. The client reads those with `pollUpdate`.
 
 ```zig
 try watcher.subscribe("score");
@@ -126,7 +126,7 @@ if (try client.setNx("leader", "node-a", 3000)) {
 }
 ```
 
-Atomic operations do not notify watchers; `subscribe` reports plain `set` and `del`. They are also single-request only, not part of a batch, since a batch is for idempotent bulk reads and writes.
+Atomic operations notify watchers like a plain set does: a successful `incr`, `append`, `setNx`, `cas`, or `getSet` pushes the key's new value, and `getDel` pushes an empty value to signal the key is gone. A `setNx` or `cas` that does not change anything pushes nothing. They are single-request only, not part of a batch, since a batch is for idempotent bulk reads and writes.
 
 ## Using it from Node
 
