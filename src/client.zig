@@ -32,18 +32,26 @@ pub const Client = struct {
     pub fn init(ip: []const u8, port: u16, opts: Options) !Client {
         const fd = c.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
         if (fd < 0) return error.SocketFailed;
+        errdefer _ = c.close(fd);
         // Roomy socket buffers so a large value fits in one datagram (on platforms that allow it).
         const bufsz: c_int = 1 << 20;
         _ = c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, @ptrCast(&bufsz), @sizeOf(c_int));
         _ = c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, @ptrCast(&bufsz), @sizeOf(c_int));
+
+        const server: posix.sockaddr.in = .{
+            .family = posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, port),
+            .addr = std.mem.nativeToBig(u32, try parseIp4(ip)),
+            .zero = [_]u8{0} ** 8,
+        };
+        // Connect the socket to the one server it talks to. Each call then uses send and recv with no
+        // per-call address, saving the kernel a route lookup, and stray datagrams from other hosts are
+        // dropped before they reach us.
+        if (c.connect(fd, @ptrCast(&server), @sizeOf(posix.sockaddr.in)) != 0) return error.ConnectFailed;
+
         return .{
             .fd = fd,
-            .server = .{
-                .family = posix.AF.INET,
-                .port = std.mem.nativeToBig(u16, port),
-                .addr = std.mem.nativeToBig(u32, try parseIp4(ip)),
-                .zero = [_]u8{0} ** 8,
-            },
+            .server = server,
             .timeout_ms = @max(1, opts.timeout_ms),
             .retries = @max(1, opts.retries),
             .backoff_cap_ms = @max(opts.timeout_ms, opts.backoff_cap_ms),
@@ -136,7 +144,7 @@ pub const Client = struct {
         while (true) {
             const remaining = deadline -| nowMs();
             if (remaining == 0 or !self.readable(@intCast(remaining))) return null;
-            const got = c.recvfrom(self.fd, &buf, buf.len, 0, null, null);
+            const got = c.recv(self.fd, &buf, buf.len, 0);
             if (got <= 0) return null;
             const msg = proto.decodeRequest(buf[0..@intCast(got)]) catch continue;
             if (msg.op != .update) continue; // a stray reply, not a change push
@@ -176,12 +184,12 @@ pub const Client = struct {
 
         var attempt: u32 = 0;
         while (attempt < self.retries) : (attempt += 1) {
-            _ = c.sendto(self.fd, &req, reqlen, 0, @ptrCast(&self.server), @sizeOf(posix.sockaddr.in));
+            _ = c.send(self.fd, &req, reqlen, 0);
             const deadline = nowMs() + self.backoffMs(attempt);
             while (true) {
                 const remaining = deadline -| nowMs();
                 if (remaining == 0 or !self.readable(@intCast(remaining))) break; // retransmit
-                const got = c.recvfrom(self.fd, resp_buf.ptr, resp_buf.len, 0, null, null);
+                const got = c.recv(self.fd, resp_buf.ptr, resp_buf.len, 0);
                 if (got <= 0) break;
                 const r = proto.decodeResponse(resp_buf[0..@intCast(got)]) catch continue;
                 if (r.id == id) return r; // a different id is a stale reply or a push: keep waiting
