@@ -37,21 +37,24 @@ zig build bench        # a loopback throughput and latency benchmark
 The server binary takes optional positional arguments for its initial size:
 
 ```sh
-zremdic-server [port] [threads] [shards] [capacity]
+zremdic-server [port] [threads] [shards] [capacity] [max_bytes]
 ```
 
 - `port` to bind on `0.0.0.0` (default 6380)
 - `threads`, one worker socket each (default: CPU count)
 - `shards`, the store's concurrency width (default 64)
 - `capacity`, the number of keys to pre-size the store for so it does not rehash as it fills (default 0, grow on demand)
+- `max_bytes`, the memory budget for keys and values before the store evicts its least recently used keys (default 0, unbounded)
 
-With no arguments it binds `0.0.0.0:6380`, runs one worker thread per CPU, and serves until stopped. Through `zig build`, pass arguments after `--`, as in `zig build run -- 6380 8 128 1000000`.
+With no arguments it binds `0.0.0.0:6380`, runs one worker thread per CPU, and serves until stopped. Through `zig build`, pass arguments after `--`, as in `zig build run -- 6380 8 128 1000000 536870912`.
 
 ## The store
 
 Keys and values are bytes. A key is at most 256 bytes and a value at most 16 KiB. Set replaces, get reads, del removes, and setting a key over the limits returns a `too_large` status rather than truncating. A small value and its reply each fit in one datagram below a typical MTU and never fragment; a value larger than the MTU travels in one fragmented datagram, which is fine on a low-loss network and is the reason this is a cache, not a store for irreplaceable blobs.
 
 A set may carry a time to live in milliseconds. The key then expires that long after the write, and the first read past the deadline finds it gone and drops it. Expiry is lazy, so it costs nothing for keys that have no TTL.
+
+The store can be capped at a number of bytes with `max_bytes`. When a write would push a shard over its share of the budget, the shard samples a handful of keys and drops the least recently used of them, repeating until it is back under the cap. Sampling approximates true LRU closely without the cost of keeping a global ordering, the way Redis does it. A bounded store holds a working set rather than growing until it runs out of memory, which is the point of a cache. Eviction is per shard and lock-local, so it does not touch the rest of the store.
 
 The keyspace is split into shards by key hash, each shard a hash map behind its own spinlock. Worker threads contend only when they touch the same shard, and a reader copies the value out under the lock, so it never observes memory a writer is freeing. More shards means less contention; the server binary uses 64. The shard count is rounded up to a power of two, so a key maps to its shard with a single bit-and rather than a modulo. The server's `capacity` argument pre-sizes the shards so the store does not rehash as it fills.
 
@@ -82,6 +85,12 @@ A delete pushes too, with an empty value, so a watcher learns the key is gone. P
 - `setEx(key, value, ttl_ms) !void`, the same with an expiry (0 means none)
 - `get(key, out: []u8) !?[]u8`, copies the value into `out` and returns that slice, or null if absent
 - `del(key) !void`
+- `incr(key) !i64`, `decr(key) !i64`, `incrBy(key, delta) !i64`, `decrBy(key, delta) !i64`, atomic counters; an absent key is 0, a non-integer value errors `error.NotANumber`
+- `append(key, suffix) !u64`, appends and returns the new length
+- `setNx(key, value, ttl_ms) !bool`, sets only if absent, returns whether it set
+- `cas(key, expected, new_value, ttl_ms) !bool`, sets `new_value` only if the current value equals `expected`, returns whether it swapped
+- `getSet(key, new_value, out) !?[]u8`, sets and returns the previous value, or null if absent
+- `getDel(key, out) !?[]u8`, removes and returns the previous value, or null if absent
 - `subscribe(key) !void`, `unsubscribe(key) !void`
 - `pollUpdate(key_out, val_out) !?Update`, waits up to one timeout for a pushed change
 - `stats() !Stats`, the server's counters
@@ -100,6 +109,24 @@ while (results.next()) |r| {
     // r.status, r.value, in the order the operations were queued
 }
 ```
+
+## Atomic operations and exactly-once
+
+`incr`, `append`, `setNx`, `cas`, `getSet`, and `getDel` change a key based on its current value, so a blind retransmit over UDP would apply them twice. The client gives each call a request id and reuses it across retransmits, and the server keeps a short-lived cache of recent replies keyed by the client address and that id. A retransmit finds the cached reply and replays it rather than running the operation again, so a counter increments exactly once even when a datagram is lost and resent. Reads and plain sets and deletes are already idempotent, so they never touch this cache and pay nothing for it. A cached reply is held for a few seconds, long enough to cover the client's retransmit window, then dropped.
+
+These cover the usual reasons to reach for a cache in a cluster:
+
+```zig
+// A counter, for rate limiting or metrics.
+const hits = try client.incrBy("rate:user:42", 1);
+
+// A lock or leader election: setNx claims it with a ttl, cas refreshes or hands it off.
+if (try client.setNx("leader", "node-a", 3000)) {
+    // held until the ttl lapses; refresh with cas("leader", "node-a", "node-a", 3000)
+}
+```
+
+Atomic operations do not notify watchers; `subscribe` reports plain `set` and `del`. They are also single-request only, not part of a batch, since a batch is for idempotent bulk reads and writes.
 
 ## Using it from Node
 
@@ -124,7 +151,9 @@ console.log(await c.get("user:1")); // "ada"
 await c.subscribe("score");
 
 const results = await c.batch().set("a", "1").get("a").send(); // one round trip
-console.log(await c.stats()); // { gets, sets, hits, misses, keys, ... }
+await c.incr("hits"); // atomic counter, exactly-once across retransmits
+await c.setNx("leader", "node-a", 3000); // claim a lock with a ttl
+console.log(await c.stats()); // { gets, sets, hits, misses, keys, evicted, ... }
 c.close();
 ```
 
@@ -137,7 +166,8 @@ Every integer is little-endian. A request is one datagram:
 ```
 offset  size  field
 0       4     id          a value the client chooses to match the reply
-4       1     op          1 get, 2 set, 3 del, 4 ping, 5 subscribe, 6 unsubscribe, 8 stats, 9 batch
+4       1     op          1 get, 2 set, 3 del, 4 ping, 5 subscribe, 6 unsubscribe, 8 stats, 9 batch,
+                          10 incrby, 11 append, 12 setnx, 13 cas, 14 getset, 15 getdel
 5       2     key_len
 7       4     val_len     the value for set, or the body for batch
 11      4     ttl_ms      for set: lifetime in milliseconds, 0 for none
@@ -157,7 +187,9 @@ offset  size  field
 
 A change push has the request layout with `op` 7 (`update`) and `id` 0, carrying the key and its new value (empty when the key was deleted). A client tells a push from a reply by the zero id, since a client never sends id 0.
 
-A `stats` reply's value is a row of nine little-endian u64 counters: gets, sets, dels, hits, misses, pushes, expired, keys, subscribers.
+For `incrby` the value is an 8-byte little-endian signed delta, and the reply value is the new counter in decimal. For `cas` the value packs the expected and new values as `expected_len(4, little-endian)` then the expected bytes then the new bytes. The mutating ops (10 through 15) carry the request id that the dedup cache keys on, and `ttl_ms` applies to the value they write.
+
+A `stats` reply's value is a row of twelve little-endian u64 counters: gets, sets, dels, hits, misses, pushes, expired, evicted, keys, bytes, subscribers, dedup_hits.
 
 A `batch` request's value is a sequence of sub-requests, each `op(1) key_len(2) val_len(4) ttl(4)` then the key and value. The reply's value is the matching sequence of sub-results, each `status(1) val_len(4)` then the value, in the same order.
 
@@ -186,7 +218,7 @@ A large value fragments. On a low-loss network that is fine; under heavy loss it
 
 The server binds one socket per worker with `SO_REUSEPORT` and shards the store, so it uses every core; on Linux each worker batches its receives and sends with `recvmmsg` and `sendmmsg`; a get writes the stored value straight into the reply datagram with no intermediate copy; a key maps to its shard with one bit-and rather than a modulo; and the client connects its socket so each call skips the per-call address and a route lookup. The remaining steps for higher packet rates are larger socket buffers under bursty load and, for read-heavy keys, a sequence-lock read path that lets readers avoid the shard lock. Horizontal scale beyond one box is client-side consistent hashing across several servers.
 
-A few limits are deliberate. There is no authentication, so bind it only to a trusted network. Values are capped at 16 KiB, and one over the MTU is sent fragmented. Operations that are not idempotent, such as a counter, would need server-side request deduplication before they could ride the same retransmitting client, so they are left out until that exists.
+A few limits are deliberate. There is no authentication, so bind it only to a trusted network. Values are capped at 16 KiB, and one over the MTU is sent fragmented. There is no persistence, no multi-key transaction, and no scripting; the atomic operations and compare-and-swap cover the common need for coordination without a stateful session over UDP.
 
 ## Layout
 
@@ -194,7 +226,8 @@ A few limits are deliberate. There is no authentication, so bind it only to a tr
 build.zig            build, with server, bench, example, and test steps
 build.zig.zon        the package manifest
 src/proto.zig        the wire protocol: encode and decode
-src/store.zig        the sharded in-memory dictionary and subscriber registry
+src/store.zig        the sharded in-memory dictionary, eviction, and subscriber registry
+src/dedup.zig        the recent-reply cache that makes mutating ops exactly-once
 src/server.zig       the UDP server: reuseport sockets, worker threads, change pushes
 src/client.zig       the client: round trips, retransmit, pushed updates
 src/zremdic.zig      the library root and end-to-end tests
