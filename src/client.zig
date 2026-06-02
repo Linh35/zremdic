@@ -130,6 +130,99 @@ pub const Client = struct {
         return proto.decodeStats(r.value) orelse error.ServerError;
     }
 
+    /// Add `delta` to the integer value of `key` (absent is treated as 0) and return the new value.
+    /// Errors `error.NotANumber` if the current value is not a valid integer.
+    pub fn incrBy(self: *Client, key: []const u8, delta: i64) !i64 {
+        var d: [8]u8 = undefined;
+        std.mem.writeInt(i64, &d, delta, .little);
+        var buf: [proto.max_datagram]u8 = undefined;
+        const r = try self.roundtrip(.incrby, key, &d, 0, &buf);
+        if (r.status != .ok) return error.NotANumber;
+        return std.fmt.parseInt(i64, r.value, 10) catch error.ServerError;
+    }
+
+    /// Add 1 to `key` and return the new value.
+    pub fn incr(self: *Client, key: []const u8) !i64 {
+        return self.incrBy(key, 1);
+    }
+
+    /// Subtract 1 from `key` and return the new value.
+    pub fn decr(self: *Client, key: []const u8) !i64 {
+        return self.incrBy(key, -1);
+    }
+
+    /// Subtract `delta` from `key` and return the new value.
+    pub fn decrBy(self: *Client, key: []const u8, delta: i64) !i64 {
+        return self.incrBy(key, -delta);
+    }
+
+    /// Append `suffix` to `key` (absent is treated as empty) and return the new length.
+    pub fn append(self: *Client, key: []const u8, suffix: []const u8) !u64 {
+        var buf: [proto.max_datagram]u8 = undefined;
+        const r = try self.roundtrip(.append, key, suffix, 0, &buf);
+        switch (r.status) {
+            .ok => return std.fmt.parseInt(u64, r.value, 10) catch error.ServerError,
+            .too_large => return error.TooLarge,
+            else => return error.ServerError,
+        }
+    }
+
+    /// Set `key` only if it is absent. Returns true if it was set, false if it already existed.
+    pub fn setNx(self: *Client, key: []const u8, value: []const u8, ttl_ms: u32) !bool {
+        var buf: [proto.max_datagram]u8 = undefined;
+        const r = try self.roundtrip(.setnx, key, value, ttl_ms, &buf);
+        switch (r.status) {
+            .ok => return r.value.len == 1 and r.value[0] == '1',
+            .too_large => return error.TooLarge,
+            else => return error.ServerError,
+        }
+    }
+
+    /// Set `key` to `new_value` only if its current value equals `expected`. Returns whether it was
+    /// swapped. Useful for optimistic locking and, with a TTL, for leases and leader election.
+    pub fn cas(self: *Client, key: []const u8, expected: []const u8, new_value: []const u8, ttl_ms: u32) !bool {
+        var vbuf: [proto.max_value]u8 = undefined;
+        const n = proto.encodeCasValue(&vbuf, expected, new_value) catch return error.TooLarge;
+        var buf: [proto.max_datagram]u8 = undefined;
+        const r = try self.roundtrip(.cas, key, vbuf[0..n], ttl_ms, &buf);
+        switch (r.status) {
+            .ok => return r.value.len == 1 and r.value[0] == '1',
+            .too_large => return error.TooLarge,
+            else => return error.ServerError,
+        }
+    }
+
+    /// Set `key` to `new_value` and return its previous value into `out`, or null if it was absent.
+    pub fn getSet(self: *Client, key: []const u8, new_value: []const u8, out: []u8) !?[]u8 {
+        var buf: [proto.max_datagram]u8 = undefined;
+        const r = try self.roundtrip(.getset, key, new_value, 0, &buf);
+        switch (r.status) {
+            .ok => {
+                const n = @min(r.value.len, out.len);
+                @memcpy(out[0..n], r.value[0..n]);
+                return out[0..n];
+            },
+            .not_found => return null,
+            .too_large => return error.TooLarge,
+            else => return error.ServerError,
+        }
+    }
+
+    /// Remove `key` and return its previous value into `out`, or null if it was absent.
+    pub fn getDel(self: *Client, key: []const u8, out: []u8) !?[]u8 {
+        var buf: [proto.max_datagram]u8 = undefined;
+        const r = try self.roundtrip(.getdel, key, "", 0, &buf);
+        switch (r.status) {
+            .ok => {
+                const n = @min(r.value.len, out.len);
+                @memcpy(out[0..n], r.value[0..n]);
+                return out[0..n];
+            },
+            .not_found => return null,
+            else => return error.ServerError,
+        }
+    }
+
     /// Begin a batch: queue several operations, then `send` them in one datagram and one round trip.
     pub fn batch(self: *Client) Batch {
         return .{ .client = self };

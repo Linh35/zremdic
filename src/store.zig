@@ -1,9 +1,11 @@
 //! The in-memory dictionary. The keyspace is split into shards by key hash, each shard a hash map
 //! behind its own mutex, so worker threads contend only when they touch the same shard. Values are
-//! copied out under the lock, so a reader never sees memory a concurrent writer is freeing.
+//! copied out under the lock, so a reader never sees memory a concurrent writer is freeing. Each
+//! shard holds a byte budget and evicts its least recently used keys when it would overflow.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const proto = @import("proto.zig");
 
 /// A subscriber's address: the UDP endpoint the server pushes change notifications to.
 pub const Addr = std.posix.sockaddr.in;
@@ -11,18 +13,31 @@ pub const Addr = std.posix.sockaddr.in;
 /// Most subscribers tracked per key. Extra subscriptions to a full key are dropped.
 pub const max_subscribers = 32;
 
+/// How many keys an eviction samples before dropping the least recently used of them. A small sample
+/// approximates true LRU closely while staying cheap, the way Redis does it.
+const evict_sample = 5;
+
 fn addrEql(a: Addr, b: Addr) bool {
     return a.port == b.port and a.addr == b.addr;
 }
 
-// A stored value and when it expires. `expires_at` is a monotonic millisecond deadline, or 0 for a
-// value that never expires.
+// A stored value with its expiry, last-access tick, and index in the shard's key list. `expires_at`
+// is a monotonic millisecond deadline, or 0 for a value that never expires. `last_access` is the
+// shard's logical clock at the most recent touch, used to pick eviction victims.
 const Entry = struct {
     bytes: []u8,
     expires_at: u64,
+    last_access: u64,
+    slot: usize,
 };
 
-fn nowMs() u64 {
+/// The status and length of a value an operation wrote into a caller buffer.
+pub const OpResult = struct {
+    status: proto.Status,
+    len: usize = 0,
+};
+
+pub fn nowMs() u64 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &ts);
     return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1_000_000;
@@ -36,15 +51,15 @@ fn sleepMs(ms: c_int) void {
 
 // A test-and-test-and-set spinlock. Shard critical sections are a map lookup plus a small memcpy,
 // so spinning beats a futex's syscall, and contention is already low because the keyspace is sharded.
-const SpinLock = struct {
+pub const SpinLock = struct {
     held: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-    fn lock(self: *SpinLock) void {
+    pub fn lock(self: *SpinLock) void {
         while (self.held.swap(true, .acquire)) {
             while (self.held.load(.monotonic)) std.atomic.spinLoopHint();
         }
     }
-    fn unlock(self: *SpinLock) void {
+    pub fn unlock(self: *SpinLock) void {
         self.held.store(false, .release);
     }
 };
@@ -54,10 +69,17 @@ pub const Store = struct {
     shards: []Shard,
     mask: usize, // shards.len is a power of two, so a key maps with one bit-and rather than a modulo
 
-    pub fn init(gpa: Allocator, shard_count: usize) !Store {
+    /// Build a store with `shard_count` shards (rounded up to a power of two). `max_bytes` is the
+    /// total key and value budget across all shards; 0 leaves the store unbounded.
+    pub fn init(gpa: Allocator, shard_count: usize, max_bytes: usize) !Store {
         const n = std.math.ceilPowerOfTwo(usize, @max(1, shard_count)) catch unreachable;
+        const per: usize = if (max_bytes == 0) 0 else @max(1, max_bytes / n);
         const shards = try gpa.alloc(Shard, n);
-        for (shards) |*s| s.* = .{ .gpa = gpa };
+        for (shards, 0..) |*s, i| s.* = .{
+            .gpa = gpa,
+            .max_bytes = per,
+            .prng = std.Random.DefaultPrng.init(nowMs() ^ i),
+        };
         return .{ .gpa = gpa, .shards = shards, .mask = n - 1 };
     }
 
@@ -86,12 +108,56 @@ pub const Store = struct {
         return self.shardFor(key).del(key);
     }
 
+    /// Add `delta` to the integer value of `key` (absent means 0), store the result, and write it as
+    /// decimal into `out`. The key's expiry is preserved. A non-integer value yields `bad_request`.
+    pub fn incrBy(self: *Store, key: []const u8, delta: i64, out: []u8) OpResult {
+        return self.shardFor(key).incrBy(key, delta, out);
+    }
+
+    /// Append `suffix` to `key` (absent means empty) and write the new length as decimal into `out`.
+    pub fn append(self: *Store, key: []const u8, suffix: []const u8, out: []u8) OpResult {
+        return self.shardFor(key).append(key, suffix, out);
+    }
+
+    /// Set `key` only if it is absent. Writes "1" into `out` if set, "0" if it already existed.
+    pub fn setNx(self: *Store, key: []const u8, value: []const u8, ttl_ms: u32, out: []u8) OpResult {
+        return self.shardFor(key).setNx(key, value, ttl_ms, out);
+    }
+
+    /// Set `key` to `new_value` only if its current value equals `expected`. Writes "1" if swapped,
+    /// "0" otherwise (including when the key is absent).
+    pub fn cas(self: *Store, key: []const u8, expected: []const u8, new_value: []const u8, ttl_ms: u32, out: []u8) OpResult {
+        return self.shardFor(key).cas(key, expected, new_value, ttl_ms, out);
+    }
+
+    /// Set `key` to `new_value` and write the previous value into `out`. The status is `not_found`
+    /// with a zero length when the key was absent.
+    pub fn getSet(self: *Store, key: []const u8, new_value: []const u8, ttl_ms: u32, out: []u8) OpResult {
+        return self.shardFor(key).getSet(key, new_value, ttl_ms, out);
+    }
+
+    /// Remove `key` and write its previous value into `out`, or `not_found` if it was absent.
+    pub fn getDel(self: *Store, key: []const u8, out: []u8) OpResult {
+        return self.shardFor(key).getDel(key, out);
+    }
+
     /// Total number of keys across all shards.
     pub fn count(self: *Store) usize {
         var total: usize = 0;
         for (self.shards) |*s| {
             s.mutex.lock();
             total += s.map.count();
+            s.mutex.unlock();
+        }
+        return total;
+    }
+
+    /// Total resident key and value bytes across all shards.
+    pub fn byteCount(self: *Store) usize {
+        var total: usize = 0;
+        for (self.shards) |*s| {
+            s.mutex.lock();
+            total += s.bytes;
             s.mutex.unlock();
         }
         return total;
@@ -105,6 +171,7 @@ pub const Store = struct {
             s.mutex.lock();
             defer s.mutex.unlock();
             try s.map.ensureTotalCapacity(s.gpa, per);
+            try s.keys.ensureTotalCapacity(s.gpa, per);
         }
     }
 
@@ -135,6 +202,17 @@ pub const Store = struct {
         return total;
     }
 
+    /// Total number of keys dropped to stay under the byte budget.
+    pub fn evictedCount(self: *Store) usize {
+        var total: usize = 0;
+        for (self.shards) |*s| {
+            s.mutex.lock();
+            total += s.evicted;
+            s.mutex.unlock();
+        }
+        return total;
+    }
+
     /// Total number of subscriptions across all keys and shards.
     pub fn subscriberCount(self: *Store) usize {
         var total: usize = 0;
@@ -157,8 +235,14 @@ const Shard = struct {
     gpa: Allocator,
     mutex: SpinLock = .{},
     map: std.StringHashMapUnmanaged(Entry) = .empty,
+    keys: std.ArrayListUnmanaged([]const u8) = .empty, // the live keys, for sampling eviction victims
     subs: std.StringHashMapUnmanaged(SubList) = .empty,
+    bytes: usize = 0, // resident key and value bytes in this shard
+    max_bytes: usize = 0, // this shard's slice of the cache budget; 0 means unbounded
+    clock: u64 = 0, // a logical clock; each access stamps an entry so eviction can find the oldest
     expired: usize = 0,
+    evicted: usize = 0,
+    prng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(0),
 
     fn deinit(self: *Shard) void {
         var it = self.map.iterator();
@@ -167,9 +251,119 @@ const Shard = struct {
             self.gpa.free(e.value_ptr.bytes);
         }
         self.map.deinit(self.gpa);
+        self.keys.deinit(self.gpa);
         var sit = self.subs.keyIterator();
         while (sit.next()) |k| self.gpa.free(k.*);
         self.subs.deinit(self.gpa);
+    }
+
+    fn tick(self: *Shard) u64 {
+        self.clock += 1;
+        return self.clock;
+    }
+
+    fn expiryFrom(ttl_ms: u32) u64 {
+        return if (ttl_ms != 0) nowMs() + ttl_ms else 0;
+    }
+
+    // Return the entry for `key` if it is present and unexpired. An expired entry is dropped here, so
+    // a stale key never lingers or feeds a read. The caller must hold the lock.
+    fn live(self: *Shard, key: []const u8) ?*Entry {
+        const e = self.map.getEntry(key) orelse return null;
+        const v = e.value_ptr;
+        if (v.expires_at != 0 and nowMs() >= v.expires_at) {
+            self.removeAt(v.slot);
+            self.expired += 1;
+            return null;
+        }
+        return v;
+    }
+
+    // Insert or overwrite `key` with a copy of `value`. When the key exists, `keep_ttl` preserves its
+    // expiry rather than setting one from `ttl_ms`. Maintains the key list, byte count, and clock,
+    // then evicts down to the budget. The caller must hold the lock.
+    fn put(self: *Shard, key: []const u8, value: []const u8, ttl_ms: u32, keep_ttl: bool) !void {
+        const gop = try self.map.getOrPut(self.gpa, key);
+        if (gop.found_existing) {
+            const old_len = gop.value_ptr.bytes.len;
+            const nv = try self.gpa.realloc(gop.value_ptr.bytes, value.len);
+            @memcpy(nv, value);
+            gop.value_ptr.bytes = nv;
+            gop.value_ptr.expires_at = if (keep_ttl) gop.value_ptr.expires_at else expiryFrom(ttl_ms);
+            gop.value_ptr.last_access = self.tick();
+            self.bytes = self.bytes - old_len + value.len;
+        } else {
+            const owned_key = self.gpa.dupe(u8, key) catch |err| {
+                self.map.removeByPtr(gop.key_ptr);
+                return err;
+            };
+            gop.key_ptr.* = owned_key;
+            const bytes = self.gpa.dupe(u8, value) catch |err| {
+                _ = self.map.remove(owned_key);
+                self.gpa.free(owned_key);
+                return err;
+            };
+            self.keys.append(self.gpa, owned_key) catch |err| {
+                _ = self.map.remove(owned_key);
+                self.gpa.free(owned_key);
+                self.gpa.free(bytes);
+                return err;
+            };
+            gop.value_ptr.* = .{
+                .bytes = bytes,
+                .expires_at = expiryFrom(ttl_ms),
+                .last_access = self.tick(),
+                .slot = self.keys.items.len - 1,
+            };
+            self.bytes += owned_key.len + value.len;
+        }
+        self.evictIfNeeded(key);
+    }
+
+    // Drop the entry at key-list index `idx`, freeing its key and value and fixing up the key list.
+    fn removeAt(self: *Shard, idx: usize) void {
+        const key = self.keys.items[idx];
+        const kv = self.map.fetchRemove(key).?;
+        self.bytes -= kv.key.len + kv.value.bytes.len;
+        self.gpa.free(kv.value.bytes);
+        _ = self.keys.swapRemove(idx);
+        self.gpa.free(kv.key); // the same allocation as `key`
+        if (idx < self.keys.items.len) {
+            // swapRemove moved the last key into idx; point its entry at the new slot
+            if (self.map.getPtr(self.keys.items[idx])) |moved| moved.slot = idx;
+        }
+    }
+
+    // While over the byte budget, sample a few keys and drop the least recently used, never the key
+    // just written (`protect`). The caller must hold the lock.
+    fn evictIfNeeded(self: *Shard, protect: []const u8) void {
+        if (self.max_bytes == 0) return;
+        while (self.bytes > self.max_bytes and self.keys.items.len > 1) {
+            const sample = @min(@as(usize, evict_sample), self.keys.items.len);
+            var victim: ?usize = null;
+            var oldest: u64 = std.math.maxInt(u64);
+            var s: usize = 0;
+            while (s < sample) : (s += 1) {
+                const idx = self.prng.random().uintLessThan(usize, self.keys.items.len);
+                const k = self.keys.items[idx];
+                if (std.mem.eql(u8, k, protect)) continue;
+                const e = self.map.getPtr(k) orelse continue;
+                if (e.last_access < oldest) {
+                    oldest = e.last_access;
+                    victim = idx;
+                }
+            }
+            if (victim) |idx| {
+                self.removeAt(idx);
+                self.evicted += 1;
+            } else break; // every sampled key was the protected one; try again next write
+        }
+    }
+
+    fn writeOut(out: []u8, status: proto.Status, value: []const u8) OpResult {
+        const n = @min(value.len, out.len);
+        @memcpy(out[0..n], value[0..n]);
+        return .{ .status = status, .len = n };
     }
 
     fn subscribe(self: *Shard, key: []const u8, addr: Addr) !void {
@@ -217,16 +411,8 @@ const Shard = struct {
     fn get(self: *Shard, key: []const u8, out: []u8) ?usize {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const e = self.map.getEntry(key) orelse return null;
-        const v = e.value_ptr;
-        if (v.expires_at != 0 and nowMs() >= v.expires_at) {
-            // expired: drop it now so it does not linger
-            self.gpa.free(e.key_ptr.*);
-            self.gpa.free(v.bytes);
-            self.map.removeByPtr(e.key_ptr);
-            self.expired += 1;
-            return null;
-        }
+        const v = self.live(key) orelse return null;
+        v.last_access = self.tick();
         const n = @min(v.bytes.len, out.len);
         @memcpy(out[0..n], v.bytes[0..n]);
         return n;
@@ -235,37 +421,98 @@ const Shard = struct {
     fn set(self: *Shard, key: []const u8, value: []const u8, ttl_ms: u32) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const expires_at: u64 = if (ttl_ms != 0) nowMs() + ttl_ms else 0;
-        const gop = try self.map.getOrPut(self.gpa, key);
-        if (gop.found_existing) {
-            const nv = try self.gpa.realloc(gop.value_ptr.bytes, value.len);
-            @memcpy(nv, value);
-            gop.value_ptr.* = .{ .bytes = nv, .expires_at = expires_at };
-        } else {
-            // getOrPut stored the borrowed `key`; replace it with a copy the shard owns.
-            const owned_key = self.gpa.dupe(u8, key) catch |err| {
-                self.map.removeByPtr(gop.key_ptr);
-                return err;
-            };
-            gop.key_ptr.* = owned_key;
-            const bytes = self.gpa.dupe(u8, value) catch |err| {
-                _ = self.map.remove(owned_key);
-                self.gpa.free(owned_key);
-                return err;
-            };
-            gop.value_ptr.* = .{ .bytes = bytes, .expires_at = expires_at };
-        }
+        return self.put(key, value, ttl_ms, false);
     }
 
     fn del(self: *Shard, key: []const u8) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
-        if (self.map.fetchRemove(key)) |kv| {
-            self.gpa.free(kv.key);
-            self.gpa.free(kv.value.bytes);
-            return true;
+        const e = self.map.getPtr(key) orelse return false;
+        const slot = e.slot;
+        const was_live = !(e.expires_at != 0 and nowMs() >= e.expires_at);
+        self.removeAt(slot);
+        if (!was_live) self.expired += 1;
+        return was_live;
+    }
+
+    fn incrBy(self: *Shard, key: []const u8, delta: i64, out: []u8) OpResult {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var cur: i64 = 0;
+        if (self.live(key)) |v| {
+            cur = std.fmt.parseInt(i64, v.bytes, 10) catch return .{ .status = .bad_request };
         }
-        return false;
+        const new_value = std.math.add(i64, cur, delta) catch return .{ .status = .bad_request };
+        var tmp: [24]u8 = undefined;
+        const s = std.fmt.bufPrint(&tmp, "{d}", .{new_value}) catch unreachable;
+        self.put(key, s, 0, true) catch return .{ .status = .bad_request };
+        return writeOut(out, .ok, s);
+    }
+
+    fn append(self: *Shard, key: []const u8, suffix: []const u8, out: []u8) OpResult {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var new_len: usize = suffix.len;
+        if (self.live(key)) |v| {
+            const total = v.bytes.len + suffix.len;
+            if (total > proto.max_value) return .{ .status = .too_large };
+            const nb = self.gpa.realloc(v.bytes, total) catch return .{ .status = .bad_request };
+            @memcpy(nb[v.bytes.len..], suffix);
+            self.bytes += suffix.len;
+            v.bytes = nb;
+            v.last_access = self.tick();
+            new_len = total;
+        } else {
+            if (suffix.len > proto.max_value) return .{ .status = .too_large };
+            self.put(key, suffix, 0, false) catch return .{ .status = .bad_request };
+        }
+        var tmp: [24]u8 = undefined;
+        const s = std.fmt.bufPrint(&tmp, "{d}", .{new_len}) catch unreachable;
+        return writeOut(out, .ok, s);
+    }
+
+    fn setNx(self: *Shard, key: []const u8, value: []const u8, ttl_ms: u32, out: []u8) OpResult {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.live(key)) |_| return writeOut(out, .ok, "0");
+        self.put(key, value, ttl_ms, false) catch return .{ .status = .bad_request };
+        return writeOut(out, .ok, "1");
+    }
+
+    fn cas(self: *Shard, key: []const u8, expected: []const u8, new_value: []const u8, ttl_ms: u32, out: []u8) OpResult {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.live(key)) |v| {
+            if (std.mem.eql(u8, v.bytes, expected)) {
+                self.put(key, new_value, ttl_ms, false) catch return .{ .status = .bad_request };
+                return writeOut(out, .ok, "1");
+            }
+        }
+        return writeOut(out, .ok, "0");
+    }
+
+    fn getSet(self: *Shard, key: []const u8, new_value: []const u8, ttl_ms: u32, out: []u8) OpResult {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var status: proto.Status = .not_found;
+        var len: usize = 0;
+        if (self.live(key)) |v| {
+            len = @min(v.bytes.len, out.len);
+            @memcpy(out[0..len], v.bytes[0..len]);
+            status = .ok;
+        }
+        self.put(key, new_value, ttl_ms, false) catch return .{ .status = .bad_request };
+        return .{ .status = status, .len = len };
+    }
+
+    fn getDel(self: *Shard, key: []const u8, out: []u8) OpResult {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const v = self.live(key) orelse return .{ .status = .not_found };
+        const len = @min(v.bytes.len, out.len);
+        @memcpy(out[0..len], v.bytes[0..len]);
+        self.removeAt(v.slot);
+        return .{ .status = .ok, .len = len };
     }
 };
 
@@ -274,7 +521,7 @@ const Shard = struct {
 const testing = std.testing;
 
 test "set, get, overwrite, delete" {
-    var s = try Store.init(testing.allocator, 8);
+    var s = try Store.init(testing.allocator, 8, 0);
     defer s.deinit();
 
     var out: [64]u8 = undefined;
@@ -293,7 +540,7 @@ test "set, get, overwrite, delete" {
 }
 
 test "a shard count that is not a power of two is rounded up and still works" {
-    var s = try Store.init(testing.allocator, 10); // rounds up to 16 shards
+    var s = try Store.init(testing.allocator, 10, 0); // rounds up to 16 shards
     defer s.deinit();
     try testing.expectEqual(@as(usize, 16), s.shards.len);
 
@@ -303,7 +550,7 @@ test "a shard count that is not a power of two is rounded up and still works" {
 }
 
 test "many keys land in their shards and all read back" {
-    var s = try Store.init(testing.allocator, 16);
+    var s = try Store.init(testing.allocator, 16, 0);
     defer s.deinit();
 
     var buf: [32]u8 = undefined;
@@ -323,7 +570,7 @@ test "many keys land in their shards and all read back" {
 }
 
 test "a key with a ttl expires and is gone on the next read" {
-    var s = try Store.init(testing.allocator, 4);
+    var s = try Store.init(testing.allocator, 4, 0);
     defer s.deinit();
 
     var out: [32]u8 = undefined;
@@ -339,8 +586,87 @@ test "a key with a ttl expires and is gone on the next read" {
     try testing.expectEqualStrings("stays", out[0..s.get("perm", &out).?]);
 }
 
+test "the store evicts least recently used keys to stay under its byte budget" {
+    // A tiny budget over many shards: one shard, so the budget bites predictably.
+    var s = try Store.init(testing.allocator, 1, 2000);
+    defer s.deinit();
+
+    var kbuf: [32]u8 = undefined;
+    const value = "0123456789" ** 5; // 50 bytes each
+
+    // Keep one key hot so it survives eviction.
+    try s.set("hot", value, 0);
+    var out: [64]u8 = undefined;
+
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        const key = try std.fmt.bufPrint(&kbuf, "cold-{d}", .{i});
+        try s.set(key, value, 0);
+        _ = s.get("hot", &out); // touch the hot key so it stays most recently used
+    }
+
+    try testing.expect(s.byteCount() <= 2000); // budget held
+    try testing.expect(s.evictedCount() > 0); // and it actually evicted
+    try testing.expect(s.get("hot", &out) != null); // the hot key was protected
+}
+
+test "incr, append, setnx, cas, getset, and getdel" {
+    var s = try Store.init(testing.allocator, 4, 0);
+    defer s.deinit();
+    var out: [64]u8 = undefined;
+
+    // incr from absent treats the key as zero
+    try testing.expectEqualStrings("1", out[0..s.incrBy("n", 1, &out).len]);
+    try testing.expectEqualStrings("11", out[0..s.incrBy("n", 10, &out).len]);
+    try testing.expectEqualStrings("9", out[0..s.incrBy("n", -2, &out).len]);
+
+    // incr on a non-integer value is rejected
+    try s.set("word", "hello", 0);
+    try testing.expectEqual(proto.Status.bad_request, s.incrBy("word", 1, &out).status);
+
+    // append returns the new length
+    try testing.expectEqualStrings("5", out[0..s.append("a", "hello", &out).len]); // new key
+    try testing.expectEqualStrings("8", out[0..s.append("a", "!!!", &out).len]);
+    try testing.expectEqualStrings("hello!!!", out[0..s.get("a", &out).?]);
+
+    // setnx sets once
+    try testing.expectEqualStrings("1", out[0..s.setNx("lock", "me", 0, &out).len]);
+    try testing.expectEqualStrings("0", out[0..s.setNx("lock", "you", 0, &out).len]);
+    try testing.expectEqualStrings("me", out[0..s.get("lock", &out).?]);
+
+    // cas swaps only on a match
+    try testing.expectEqualStrings("1", out[0..s.cas("lock", "me", "owned", 0, &out).len]);
+    try testing.expectEqualStrings("0", out[0..s.cas("lock", "me", "again", 0, &out).len]);
+    try testing.expectEqualStrings("owned", out[0..s.get("lock", &out).?]);
+
+    // getset returns the old value, getdel removes and returns it
+    const gs = s.getSet("lock", "fresh", 0, &out);
+    try testing.expectEqual(proto.Status.ok, gs.status);
+    try testing.expectEqualStrings("owned", out[0..gs.len]);
+    const gd = s.getDel("lock", &out);
+    try testing.expectEqual(proto.Status.ok, gd.status);
+    try testing.expectEqualStrings("fresh", out[0..gd.len]);
+    try testing.expect(s.get("lock", &out) == null);
+
+    // getset and getdel on an absent key report not_found
+    try testing.expectEqual(proto.Status.not_found, s.getDel("ghost", &out).status);
+    try testing.expectEqual(proto.Status.not_found, s.getSet("ghost", "v", 0, &out).status);
+}
+
+test "incr preserves an existing ttl" {
+    var s = try Store.init(testing.allocator, 4, 0);
+    defer s.deinit();
+    var out: [64]u8 = undefined;
+
+    try s.set("n", "5", 40);
+    _ = s.incrBy("n", 1, &out);
+    try testing.expectEqualStrings("6", out[0..s.get("n", &out).?]);
+    sleepMs(70);
+    try testing.expect(s.get("n", &out) == null); // the ttl still fired after the incr
+}
+
 test "subscribers register once, list back, and unsubscribe" {
-    var s = try Store.init(testing.allocator, 4);
+    var s = try Store.init(testing.allocator, 4, 0);
     defer s.deinit();
 
     const a: Addr = .{ .family = std.posix.AF.INET, .port = 1, .addr = 100, .zero = [_]u8{0} ** 8 };
@@ -360,7 +686,7 @@ test "subscribers register once, list back, and unsubscribe" {
 }
 
 test "concurrent writers and readers across threads stay consistent" {
-    var s = try Store.init(testing.allocator, 32);
+    var s = try Store.init(testing.allocator, 32, 0);
     defer s.deinit();
 
     const Worker = struct {

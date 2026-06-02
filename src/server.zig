@@ -10,9 +10,11 @@ const posix = std.posix;
 const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
 const proto = @import("proto.zig");
-const Store = @import("store.zig").Store;
-const Addr = @import("store.zig").Addr;
-const max_subscribers = @import("store.zig").max_subscribers;
+const store = @import("store.zig");
+const Store = store.Store;
+const Addr = store.Addr;
+const max_subscribers = store.max_subscribers;
+const Dedup = @import("dedup.zig").Dedup;
 
 // On Linux a worker receives and replies to a whole batch of datagrams per syscall with recvmmsg and
 // sendmmsg. Elsewhere it falls back to one recvfrom and one sendto per datagram.
@@ -26,6 +28,12 @@ pub const Options = struct {
     /// Pre-size the store for roughly this many keys, so it does not rehash as it fills. Zero
     /// leaves the store to grow on demand.
     capacity: usize = 0,
+    /// Total key and value budget in bytes across all shards. When the store would exceed it, the
+    /// least recently used keys are evicted. Zero leaves the store unbounded.
+    max_bytes: usize = 0,
+    /// Lock stripes for the retransmit-dedup cache, and how long a cached reply is kept.
+    dedup_stripes: usize = 256,
+    dedup_ttl_ms: u64 = 5000,
     recv_buf_bytes: c_int = 4 << 20,
 };
 
@@ -47,6 +55,7 @@ const WorkerStats = struct {
 pub const Server = struct {
     gpa: Allocator,
     store: Store,
+    dedup: Dedup,
     sockets: []c.fd_t,
     workers: []std.Thread,
     worker_stats: []WorkerStats,
@@ -73,16 +82,20 @@ pub const Server = struct {
         _ = c.getsockname(sockets[0], @ptrCast(&addr), &len);
         for (sockets[1..]) |*s| s.* = try bindSocket(&addr, opts.recv_buf_bytes);
 
-        var store = try Store.init(gpa, opts.shards);
-        errdefer store.deinit();
-        if (opts.capacity > 0) try store.reserve(opts.capacity);
+        var kv = try Store.init(gpa, opts.shards, opts.max_bytes);
+        errdefer kv.deinit();
+        if (opts.capacity > 0) try kv.reserve(opts.capacity);
+
+        var dedup = try Dedup.init(gpa, opts.dedup_stripes, opts.dedup_ttl_ms);
+        errdefer dedup.deinit();
 
         const stats = try gpa.alloc(WorkerStats, n);
         for (stats) |*s| s.* = .{};
 
         return .{
             .gpa = gpa,
-            .store = store,
+            .store = kv,
+            .dedup = dedup,
             .sockets = sockets,
             .workers = try gpa.alloc(std.Thread, n),
             .worker_stats = stats,
@@ -99,6 +112,7 @@ pub const Server = struct {
         self.gpa.free(self.workers);
         self.gpa.free(self.worker_stats);
         self.store.deinit();
+        self.dedup.deinit();
     }
 
     /// The port the server is actually bound to.
@@ -255,7 +269,60 @@ pub const Server = struct {
                 }
                 return try proto.encodeResponse(sbuf, .{ .id = req.id, .status = .ok, .value = body[0..pos] });
             },
+            .incrby, .append, .setnx, .cas, .getset, .getdel => return try self.applyMutating(req, from, sbuf, stats),
             .update => return 0, // a server-to-client message; clients never send it
+        }
+    }
+
+    // Apply a non-idempotent op through the dedup cache so a retransmit replays the first reply
+    // instead of mutating twice. Idempotent ops never reach here, so they pay nothing for dedup.
+    fn applyMutating(self: *Server, req: proto.Request, from: Addr, sbuf: []u8, stats: *WorkerStats) !usize {
+        var vbuf: [proto.max_value]u8 = undefined;
+        switch (self.dedup.lookup(from, req.id, &vbuf)) {
+            .hit => |r| return try proto.encodeResponse(sbuf, .{ .id = req.id, .status = r.status, .value = r.value }),
+            .miss => |ticket| {
+                const res = self.runMutating(req, &vbuf, stats);
+                self.dedup.commit(ticket, res.status, vbuf[0..res.len]);
+                return try proto.encodeResponse(sbuf, .{ .id = req.id, .status = res.status, .value = vbuf[0..res.len] });
+            },
+        }
+    }
+
+    // Run one non-idempotent op against the store, writing any reply value into `out`. These do not
+    // notify watchers; subscribe sees plain set and del.
+    fn runMutating(self: *Server, req: proto.Request, out: []u8, stats: *WorkerStats) store.OpResult {
+        switch (req.op) {
+            .incrby => {
+                if (req.value.len != 8) return .{ .status = .bad_request };
+                const delta = std.mem.readInt(i64, req.value[0..8], .little);
+                WorkerStats.bump(&stats.sets, 1);
+                return self.store.incrBy(req.key, delta, out);
+            },
+            .append => {
+                WorkerStats.bump(&stats.sets, 1);
+                return self.store.append(req.key, req.value, out);
+            },
+            .setnx => {
+                if (req.value.len > proto.max_value) return .{ .status = .too_large };
+                WorkerStats.bump(&stats.sets, 1);
+                return self.store.setNx(req.key, req.value, req.ttl_ms, out);
+            },
+            .cas => {
+                const c2 = proto.decodeCasValue(req.value) orelse return .{ .status = .bad_request };
+                if (c2.new_value.len > proto.max_value) return .{ .status = .too_large };
+                WorkerStats.bump(&stats.sets, 1);
+                return self.store.cas(req.key, c2.expected, c2.new_value, req.ttl_ms, out);
+            },
+            .getset => {
+                if (req.value.len > proto.max_value) return .{ .status = .too_large };
+                WorkerStats.bump(&stats.sets, 1);
+                return self.store.getSet(req.key, req.value, req.ttl_ms, out);
+            },
+            .getdel => {
+                WorkerStats.bump(&stats.dels, 1);
+                return self.store.getDel(req.key, out);
+            },
+            else => return .{ .status = .bad_request },
         }
     }
 
@@ -314,8 +381,11 @@ pub const Server = struct {
             s.pushes += w.pushes.load(.monotonic);
         }
         s.expired = self.store.expiredCount();
+        s.evicted = self.store.evictedCount();
         s.keys = self.store.count();
+        s.bytes = self.store.byteCount();
         s.subscribers = self.store.subscriberCount();
+        s.dedup_hits = self.dedup.hitCount();
         return s;
     }
 };

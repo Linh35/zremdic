@@ -19,7 +19,25 @@ pub const Op = enum(u8) {
     update = 7, // server to client: a subscribed key changed
     stats = 8,
     batch = 9, // the value carries a sequence of sub-requests; the reply carries their results
+    // The ops below mutate based on the current value, so they are not idempotent. A client gives
+    // each a request id and the server deduplicates retransmits, so a retransmit replays the first
+    // reply rather than applying the change twice.
+    incrby = 10, // value is an 8-byte little-endian i64 delta; reply is the new counter in decimal
+    append = 11, // value is appended to the current one; reply is the new length in decimal
+    setnx = 12, // set only if absent; reply is "1" if set, "0" if the key already existed
+    cas = 13, // set the new value only if the current one equals the expected one; reply "1" or "0"
+    getset = 14, // set the new value and reply with the old one (not_found if the key was absent)
+    getdel = 15, // delete the key and reply with its old value (not_found if the key was absent)
 };
+
+/// Whether an op changes state in a way that a blind retransmit would apply twice. The server routes
+/// these through deduplication; the rest are safe to replay.
+pub fn isMutating(op: Op) bool {
+    return switch (op) {
+        .incrby, .append, .setnx, .cas, .getset, .getdel => true,
+        else => false,
+    };
+}
 
 pub const Status = enum(u8) { ok = 0, not_found = 1, too_large = 2, bad_request = 3 };
 
@@ -118,8 +136,11 @@ pub const Stats = struct {
     misses: u64 = 0,
     pushes: u64 = 0,
     expired: u64 = 0,
+    evicted: u64 = 0, // keys dropped to stay under the memory cap
     keys: u64 = 0,
+    bytes: u64 = 0, // resident key and value bytes
     subscribers: u64 = 0,
+    dedup_hits: u64 = 0, // retransmits answered from the dedup cache without reapplying
 };
 
 const stats_fields = @typeInfo(Stats).@"struct".fields.len;
@@ -138,6 +159,29 @@ pub fn decodeStats(buf: []const u8) ?Stats {
         @field(s, f.name) = std.mem.readInt(u64, buf[i * 8 ..][0..8], .little);
     }
     return s;
+}
+
+// --- compare-and-swap ----------------------------------------------------------------------------
+// A cas request carries two values, the expected current value and the new one, packed into the one
+// value field as: expected_len(4, little-endian) then the expected bytes then the new bytes.
+
+pub fn encodeCasValue(buf: []u8, expected: []const u8, new_value: []const u8) EncodeError!usize {
+    const total = 4 + expected.len + new_value.len;
+    if (buf.len < total) return error.BufferTooSmall;
+    if (total > max_value) return error.ValueTooLong;
+    std.mem.writeInt(u32, buf[0..4], @intCast(expected.len), .little);
+    @memcpy(buf[4..][0..expected.len], expected);
+    @memcpy(buf[4 + expected.len ..][0..new_value.len], new_value);
+    return total;
+}
+
+pub const Cas = struct { expected: []const u8, new_value: []const u8 };
+
+pub fn decodeCasValue(buf: []const u8) ?Cas {
+    if (buf.len < 4) return null;
+    const elen = std.mem.readInt(u32, buf[0..4], .little);
+    if (4 + elen > buf.len) return null;
+    return .{ .expected = buf[4..][0..elen], .new_value = buf[4 + elen ..] };
 }
 
 // --- batches -------------------------------------------------------------------------------------
@@ -275,6 +319,19 @@ test "a response assembled in place decodes the same as an encoded one" {
     try testing.expectEqual(@as(u32, 99), r.id);
     try testing.expectEqual(Status.ok, r.status);
     try testing.expectEqualStrings(value, r.value);
+}
+
+test "a cas value packs the expected and new values and unpacks them" {
+    var buf: [64]u8 = undefined;
+    const n = try encodeCasValue(&buf, "old", "brand-new");
+    const cas = decodeCasValue(buf[0..n]).?;
+    try testing.expectEqualStrings("old", cas.expected);
+    try testing.expectEqualStrings("brand-new", cas.new_value);
+
+    const empty = try encodeCasValue(&buf, "", "x");
+    const c2 = decodeCasValue(buf[0..empty]).?;
+    try testing.expectEqual(@as(usize, 0), c2.expected.len);
+    try testing.expectEqualStrings("x", c2.new_value);
 }
 
 test "stats round-trip" {

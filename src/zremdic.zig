@@ -184,6 +184,103 @@ test "a large value round-trips whole" {
     try testing.expectEqualSlices(u8, &big, got);
 }
 
+test "atomic operations over the wire" {
+    var server = try Server.init(testing.allocator, .{ .ip = "127.0.0.1", .port = 0, .threads = 2, .shards = 4 });
+    defer server.deinit();
+    try server.start();
+
+    var client = try Client.init("127.0.0.1", server.port(), .{ .timeout_ms = 500, .retries = 5 });
+    defer client.deinit();
+
+    try testing.expectEqual(@as(i64, 1), try client.incr("hits"));
+    try testing.expectEqual(@as(i64, 6), try client.incrBy("hits", 5));
+    try testing.expectEqual(@as(i64, 5), try client.decr("hits"));
+
+    try testing.expectEqual(@as(u64, 5), try client.append("name", "hello"));
+    try testing.expectEqual(@as(u64, 8), try client.append("name", "!!!"));
+
+    try testing.expect(try client.setNx("lock", "me", 0));
+    try testing.expect(!try client.setNx("lock", "you", 0));
+    try testing.expect(try client.cas("lock", "me", "owned", 0));
+    try testing.expect(!try client.cas("lock", "me", "nope", 0));
+
+    var out: [64]u8 = undefined;
+    try testing.expectEqualStrings("owned", (try client.getSet("lock", "fresh", &out)).?);
+    try testing.expectEqualStrings("fresh", (try client.getDel("lock", &out)).?);
+    try testing.expect((try client.getDel("lock", &out)) == null);
+
+    try client.set("word", "abc");
+    try testing.expectError(error.NotANumber, client.incr("word"));
+}
+
+test "the server evicts under a byte budget" {
+    var server = try Server.init(testing.allocator, .{ .ip = "127.0.0.1", .port = 0, .threads = 1, .shards = 1, .max_bytes = 4096 });
+    defer server.deinit();
+    try server.start();
+
+    var client = try Client.init("127.0.0.1", server.port(), .{ .timeout_ms = 500, .retries = 8 });
+    defer client.deinit();
+
+    var kbuf: [32]u8 = undefined;
+    const value = "0123456789" ** 6; // 60 bytes
+    var i: usize = 0;
+    while (i < 500) : (i += 1) {
+        const key = try std.fmt.bufPrint(&kbuf, "key-{d}", .{i});
+        try client.set(key, value);
+    }
+
+    const s = try client.stats();
+    try testing.expect(s.bytes <= 4096); // budget held
+    try testing.expect(s.evicted > 0); // and it evicted to get there
+    try testing.expect(s.keys < 500); // so not everything survived
+}
+
+test "a retransmitted mutating request is applied once" {
+    var server = try Server.init(testing.allocator, .{ .ip = "127.0.0.1", .port = 0, .threads = 1, .shards = 4 });
+    defer server.deinit();
+    try server.start();
+
+    const c = std.c;
+    const posix = std.posix;
+    const fd = c.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
+    try testing.expect(fd >= 0);
+    defer _ = c.close(fd);
+    var sa: posix.sockaddr.in = .{
+        .family = posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, server.port()),
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+        .zero = [_]u8{0} ** 8,
+    };
+    try testing.expect(c.connect(fd, @ptrCast(&sa), @sizeOf(posix.sockaddr.in)) == 0);
+
+    var delta: [8]u8 = undefined;
+    std.mem.writeInt(i64, &delta, 1, .little);
+    var req: [proto.max_datagram]u8 = undefined;
+    var rbuf: [proto.max_datagram]u8 = undefined;
+
+    // The same datagram (same id) sent twice stands in for a retransmit. The counter must end at 1.
+    const n = try proto.encodeRequest(&req, .{ .id = 777, .op = .incrby, .key = "counter", .value = &delta });
+    var attempt: usize = 0;
+    while (attempt < 2) : (attempt += 1) {
+        _ = c.send(fd, &req, n, 0);
+        var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+        try testing.expect(c.poll(&pfd, 1, 1000) > 0);
+        const got = c.recv(fd, &rbuf, rbuf.len, 0);
+        try testing.expect(got > 0);
+        const resp = try proto.decodeResponse(rbuf[0..@intCast(got)]);
+        try testing.expectEqualStrings("1", resp.value); // both replies are 1, not 1 then 2
+    }
+
+    // A fresh id is a new logical request, so it does increment.
+    const m = try proto.encodeRequest(&req, .{ .id = 778, .op = .incrby, .key = "counter", .value = &delta });
+    _ = c.send(fd, &req, m, 0);
+    var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+    try testing.expect(c.poll(&pfd, 1, 1000) > 0);
+    const got = c.recv(fd, &rbuf, rbuf.len, 0);
+    const resp = try proto.decodeResponse(rbuf[0..@intCast(got)]);
+    try testing.expectEqualStrings("2", resp.value);
+}
+
 // Sleep for `ms` by polling no descriptors.
 fn sleepMs(ms: c_int) void {
     var none: [0]std.posix.pollfd = .{};
