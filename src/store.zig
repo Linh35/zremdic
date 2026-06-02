@@ -52,11 +52,13 @@ const SpinLock = struct {
 pub const Store = struct {
     gpa: Allocator,
     shards: []Shard,
+    mask: usize, // shards.len is a power of two, so a key maps with one bit-and rather than a modulo
 
     pub fn init(gpa: Allocator, shard_count: usize) !Store {
-        const shards = try gpa.alloc(Shard, @max(1, shard_count));
+        const n = std.math.ceilPowerOfTwo(usize, @max(1, shard_count)) catch unreachable;
+        const shards = try gpa.alloc(Shard, n);
         for (shards) |*s| s.* = .{ .gpa = gpa };
-        return .{ .gpa = gpa, .shards = shards };
+        return .{ .gpa = gpa, .shards = shards, .mask = n - 1 };
     }
 
     pub fn deinit(self: *Store) void {
@@ -65,7 +67,7 @@ pub const Store = struct {
     }
 
     fn shardFor(self: *Store, key: []const u8) *Shard {
-        return &self.shards[std.hash.Wyhash.hash(0, key) % self.shards.len];
+        return &self.shards[std.hash.Wyhash.hash(0, key) & self.mask];
     }
 
     /// Copy the value for `key` into `out` and return its length, or null if the key is absent.
@@ -288,6 +290,16 @@ test "set, get, overwrite, delete" {
     try testing.expect(s.del("k"));
     try testing.expect(!s.del("k"));
     try testing.expect(s.get("k", &out) == null);
+}
+
+test "a shard count that is not a power of two is rounded up and still works" {
+    var s = try Store.init(testing.allocator, 10); // rounds up to 16 shards
+    defer s.deinit();
+    try testing.expectEqual(@as(usize, 16), s.shards.len);
+
+    var out: [16]u8 = undefined;
+    try s.set("k", "v", 0);
+    try testing.expectEqualStrings("v", out[0..s.get("k", &out).?]);
 }
 
 test "many keys land in their shards and all read back" {
